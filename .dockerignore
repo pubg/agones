@@ -15,7 +15,14 @@
 # project specific
 .*
 /build
-/cmd
+# Exclude cmd by default but allow specific services for Docker builds
+/cmd/*
+!/cmd/allocator/**
+!/cmd/controller/**
+!/cmd/extensions/**
+!/cmd/ping/**
+!/cmd/processor/**
+!/cmd/sdk-server/**
 /sdks/cpp/.build
 /sdks/cpp/.archives
 .idea

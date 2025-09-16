@@ -16,61 +16,32 @@ package gameserversets
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	listerv1 "agones.dev/agones/pkg/client/listers/agones/v1"
-	mt "agones.dev/agones/pkg/metrics"
 	"agones.dev/agones/pkg/util/runtime"
 	"github.com/sirupsen/logrus"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/stats/view"
-	"go.opencensus.io/tag"
 )
 
 var (
 	logger = runtime.NewLoggerWithSource("metrics")
 
-	keyName      = mt.MustTagKey("name")
-	keyNamespace = mt.MustTagKey("namespace")
-	keyFleetName = mt.MustTagKey("fleet_name")
-	keyType      = mt.MustTagKey("type")
+	keyName      = "name"
+	keyNamespace = "namespace"
+	keyFleetName = "fleet_name"
+	keyType      = "type"
 
-	gameServerCreationDuration = stats.Float64("gameserver_creation/duration", "The duration of gameserver creation", "s")
-
-	stateViews = []*view.View{
-		{
-			Name:        "gameserver_creation_duration",
-			Measure:     gameServerCreationDuration,
-			Description: "The time gameserver takes to be created in seconds",
-			Aggregation: view.Distribution(0, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2, 3),
-			TagKeys:     []tag.Key{keyName, keyType, keyFleetName, keyNamespace},
-		},
-	}
+	// deprecated in favor of OpenTelemetry metrics in pkg/gameserversets/controller_metrics.go
 )
 
 // register all our state views to OpenCensus
-func registerViews() {
-	for _, v := range stateViews {
-		if err := view.Register(v); err != nil {
-			logger.WithError(err).Error("could not register view")
-		}
-	}
-}
+func registerViews() {}
 
 // unregister views, this is only useful for tests as it trigger reporting.
-func unRegisterViews() {
-	for _, v := range stateViews {
-		view.Unregister(v)
-	}
-}
+func unRegisterViews() {}
 
 // default set of tags for latency metric
-var latencyTags = []tag.Mutator{
-	tag.Insert(keyName, "none"),
-	tag.Insert(keyFleetName, "none"),
-	tag.Insert(keyType, "none"),
-}
+var latencyTags = []interface{}{"deprecated"}
 
 type metrics struct {
 	ctx              context.Context
@@ -80,25 +51,13 @@ type metrics struct {
 }
 
 // record the current current gameserver creation latency
-func (r *metrics) record() {
-	stats.Record(r.ctx, gameServerCreationDuration.M(time.Since(r.start).Seconds()))
-}
+func (r *metrics) record() {}
 
 // mutate the current set of metric tags
-func (r *metrics) mutate(m ...tag.Mutator) {
-	var err error
-	r.ctx, err = tag.New(r.ctx, m...)
-	if err != nil {
-		r.logger.WithError(err).Warn("failed to mutate request context.")
-	}
-}
+func (r *metrics) mutate(_ ...interface{}) {}
 
 // setError set the latency status tag as error.
-func (r *metrics) setError(errorType string) {
-	r.mutate(tag.Update(keyType, errorType))
-}
+func (r *metrics) setError(errorType string) { _ = errorType }
 
 // setRequest set request metric tags.
-func (r *metrics) setRequest(count int) {
-	r.mutate(tag.Update(keyName, fmt.Sprint(count)))
-}
+func (r *metrics) setRequest(count int) { _ = count }

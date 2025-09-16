@@ -32,12 +32,17 @@ import (
 	getterv1 "agones.dev/agones/pkg/client/clientset/versioned/typed/agones/v1"
 	multiclusterinformerv1 "agones.dev/agones/pkg/client/informers/externalversions/multicluster/v1"
 	multiclusterlisterv1 "agones.dev/agones/pkg/client/listers/multicluster/v1"
+	"agones.dev/agones/pkg/otelctx"
 	"agones.dev/agones/pkg/util/apiserver"
 	"agones.dev/agones/pkg/util/logfields"
 	"agones.dev/agones/pkg/util/runtime"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"go.opencensus.io/tag"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -141,7 +146,7 @@ func NewAllocator(policyInformer multiclusterinformerv1.GameServerAllocationPoli
 		remoteAllocationTimeout:      remoteAllocationTimeout,
 		totalRemoteAllocationTimeout: totalRemoteAllocationTimeout,
 		remoteAllocationCallback: func(ctx context.Context, endpoint string, dialOpts grpc.DialOption, request *pb.AllocationRequest) (*pb.AllocationResponse, error) {
-			conn, err := grpc.NewClient(endpoint, dialOpts)
+			conn, err := grpc.NewClient(endpoint, dialOpts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 			if err != nil {
 				return nil, err
 			}
@@ -190,51 +195,69 @@ func (c *Allocator) Sync(ctx context.Context) error {
 
 // Allocate CRDHandler for allocating a gameserver.
 func (c *Allocator) Allocate(ctx context.Context, gsa *allocationv1.GameServerAllocation) (out k8sruntime.Object, err error) {
-	latency := c.newMetrics(ctx)
-	defer func() {
+	// Root span for allocation request
+	return otelctx.WithContext2(ctx, func() (k8sruntime.Object, error) {
+		tracer := otel.Tracer("agones.dev/agones/allocator")
+		ctx, span := tracer.Start(ctx, "allocator.allocate_request", trace.WithSpanKind(trace.SpanKindInternal))
+		span.SetAttributes(
+			attribute.String("allocation.namespace", gsa.Namespace),
+			attribute.String("allocation.name", gsa.Name),
+			attribute.Bool("allocation.multicluster", gsa.Spec.MultiClusterSetting.Enabled),
+			attribute.String("allocation.scheduling", string(gsa.Spec.Scheduling)),
+		)
+		defer func() {
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(otelcodes.Error, err.Error())
+			}
+			span.End()
+		}()
+		latency := c.newMetrics(ctx)
+		defer func() {
+			if err != nil {
+				latency.setError()
+			}
+			latency.record()
+		}()
+		latency.setRequest(gsa)
+
+		// server side validation
+		if errs := gsa.Validate(); len(errs) > 0 {
+			kind := runtimeschema.GroupKind{
+				Group: allocationv1.SchemeGroupVersion.Group,
+				Kind:  "GameServerAllocation",
+			}
+			statusErr := k8serrors.NewInvalid(kind, gsa.Name, errs)
+			s := &statusErr.ErrStatus
+			var gvks []schema.GroupVersionKind
+			gvks, _, err := apiserver.Scheme.ObjectKinds(s)
+			if err != nil {
+				return nil, errors.Wrap(err, "could not find objectkinds for status")
+			}
+
+			c.loggerForGameServerAllocation(gsa).Debug("GameServerAllocation is invalid")
+			s.TypeMeta = metav1.TypeMeta{Kind: gvks[0].Kind, APIVersion: gvks[0].Version}
+			return s, nil
+		}
+
+		// Convert gsa required and preferred fields to selectors field
+		gsa.Converter()
+
+		// If multi-cluster setting is enabled, allocate base on the multicluster allocation policy.
+		if gsa.Spec.MultiClusterSetting.Enabled {
+			out, err = c.applyMultiClusterAllocation(ctx, gsa)
+		} else {
+			out, err = c.allocateFromLocalCluster(ctx, gsa)
+		}
+
 		if err != nil {
-			latency.setError()
+			c.loggerForGameServerAllocation(gsa).WithError(err).Error("allocation failed")
+			return nil, err
 		}
-		latency.record()
-	}()
-	latency.setRequest(gsa)
+		latency.setResponse(out)
 
-	// server side validation
-	if errs := gsa.Validate(); len(errs) > 0 {
-		kind := runtimeschema.GroupKind{
-			Group: allocationv1.SchemeGroupVersion.Group,
-			Kind:  "GameServerAllocation",
-		}
-		statusErr := k8serrors.NewInvalid(kind, gsa.Name, errs)
-		s := &statusErr.ErrStatus
-		var gvks []schema.GroupVersionKind
-		gvks, _, err := apiserver.Scheme.ObjectKinds(s)
-		if err != nil {
-			return nil, errors.Wrap(err, "could not find objectkinds for status")
-		}
-
-		c.loggerForGameServerAllocation(gsa).Debug("GameServerAllocation is invalid")
-		s.TypeMeta = metav1.TypeMeta{Kind: gvks[0].Kind, APIVersion: gvks[0].Version}
-		return s, nil
-	}
-
-	// Convert gsa required and preferred fields to selectors field
-	gsa.Converter()
-
-	// If multi-cluster setting is enabled, allocate base on the multicluster allocation policy.
-	if gsa.Spec.MultiClusterSetting.Enabled {
-		out, err = c.applyMultiClusterAllocation(ctx, gsa)
-	} else {
-		out, err = c.allocateFromLocalCluster(ctx, gsa)
-	}
-
-	if err != nil {
-		c.loggerForGameServerAllocation(gsa).WithError(err).Error("allocation failed")
-		return nil, err
-	}
-	latency.setResponse(out)
-
-	return out, nil
+		return out, nil
+	})
 }
 
 func (c *Allocator) loggerForGameServerAllocationKey(key string) *logrus.Entry {
@@ -252,16 +275,22 @@ func (c *Allocator) loggerForGameServerAllocation(gsa *allocationv1.GameServerAl
 // allocateFromLocalCluster allocates gameservers from the local cluster.
 // Registers number of times we retried before getting a success allocation
 func (c *Allocator) allocateFromLocalCluster(ctx context.Context, gsa *allocationv1.GameServerAllocation) (*allocationv1.GameServerAllocation, error) {
+	tracer := otel.Tracer("agones.dev/agones/allocator")
+	ctx, span := tracer.Start(ctx, "allocator.allocate_local", trace.WithSpanKind(trace.SpanKindInternal))
+	defer span.End()
 	var gs *agonesv1.GameServer
 	retry := c.newMetrics(ctx)
 	retryCount := 0
 	err := Retry(allocationRetry, func() error {
+		attempt := retryCount + 1
+		span.AddEvent("allocation_attempt", trace.WithAttributes(attribute.Int("attempt", attempt)))
 		var err error
 		gs, err = c.allocate(ctx, gsa)
 		retryCount++
 
 		if err != nil {
 			c.loggerForGameServerAllocation(gsa).WithError(err).Warn("Failed to Allocated. Retrying...")
+			span.AddEvent("allocation_retry_error", trace.WithAttributes(attribute.String("error", err.Error())))
 		} else {
 			retry.recordAllocationRetrySuccess(ctx, retryCount)
 		}
@@ -298,12 +327,16 @@ func (c *Allocator) allocateFromLocalCluster(ctx context.Context, gsa *allocatio
 	}
 
 	c.loggerForGameServerAllocation(gsa).Debug("Game server allocation")
+	span.SetAttributes(attribute.String("allocation.outcome", string(gsa.Status.State)))
 	return gsa, nil
 }
 
 // applyMultiClusterAllocation retrieves allocation policies and iterate on policies.
 // Then allocate gameservers from local or remote cluster accordingly.
 func (c *Allocator) applyMultiClusterAllocation(ctx context.Context, gsa *allocationv1.GameServerAllocation) (result *allocationv1.GameServerAllocation, err error) {
+	tracer := otel.Tracer("agones.dev/agones/allocator")
+	ctx, span := tracer.Start(ctx, "allocator.multicluster_selection", trace.WithSpanKind(trace.SpanKindInternal))
+	defer span.End()
 	selector := labels.Everything()
 	if len(gsa.Spec.MultiClusterSetting.PolicySelector.MatchLabels)+len(gsa.Spec.MultiClusterSetting.PolicySelector.MatchExpressions) != 0 {
 		selector, err = metav1.LabelSelectorAsSelector(&gsa.Spec.MultiClusterSetting.PolicySelector)
@@ -325,6 +358,10 @@ func (c *Allocator) applyMultiClusterAllocation(ctx context.Context, gsa *alloca
 		if connectionInfo == nil {
 			break
 		}
+		span.AddEvent("policy_evaluated", trace.WithAttributes(
+			attribute.String("policy.namespace", connectionInfo.Namespace),
+			attribute.Int("policy.endpoints", len(connectionInfo.AllocationEndpoints)),
+		))
 		if len(connectionInfo.AllocationEndpoints) == 0 {
 			// Change the namespace to the policy namespace and allocate locally
 			gsaCopy := gsa
@@ -337,7 +374,7 @@ func (c *Allocator) applyMultiClusterAllocation(ctx context.Context, gsa *alloca
 				c.loggerForGameServerAllocation(gsaCopy).WithError(err).Error("self-allocation failed")
 			}
 		} else {
-			result, err = c.allocateFromRemoteCluster(gsa, connectionInfo, gsa.ObjectMeta.Namespace)
+			result, err = c.allocateFromRemoteCluster(ctx, gsa, connectionInfo, gsa.ObjectMeta.Namespace)
 			if err != nil {
 				c.loggerForGameServerAllocation(gsa).WithField("allocConnInfo", connectionInfo).WithError(err).Error("remote-allocation failed")
 			}
@@ -351,7 +388,15 @@ func (c *Allocator) applyMultiClusterAllocation(ctx context.Context, gsa *alloca
 
 // allocateFromRemoteCluster allocates gameservers from a remote cluster by making
 // an http call to allocation service in that cluster.
-func (c *Allocator) allocateFromRemoteCluster(gsa *allocationv1.GameServerAllocation, connectionInfo *multiclusterv1.ClusterConnectionInfo, namespace string) (*allocationv1.GameServerAllocation, error) {
+func (c *Allocator) allocateFromRemoteCluster(ctx context.Context, gsa *allocationv1.GameServerAllocation, connectionInfo *multiclusterv1.ClusterConnectionInfo, namespace string) (*allocationv1.GameServerAllocation, error) {
+	tracer := otel.Tracer("agones.dev/agones/allocator")
+	// Separate span to represent a remote call attempt chain; preserve inbound context for propagation
+	ctx, span := tracer.Start(ctx, "allocator.allocate_remote", trace.WithSpanKind(trace.SpanKindClient))
+	span.SetAttributes(
+		attribute.String("target.namespace", namespace),
+		attribute.String("gsa.namespace", gsa.Namespace),
+	)
+	defer span.End()
 	var allocationResponse *pb.AllocationResponse
 
 	// TODO: cache the client
@@ -367,7 +412,8 @@ func (c *Allocator) allocateFromRemoteCluster(gsa *allocationv1.GameServerAlloca
 	request.MultiClusterSetting.Enabled = false
 	request.Namespace = connectionInfo.Namespace
 
-	ctx, cancel := context.WithTimeout(context.Background(), c.totalRemoteAllocationTimeout)
+	// Preserve parent trace and cancellation while enforcing a total timeout for remote call
+	ctx, cancel := context.WithTimeout(ctx, c.totalRemoteAllocationTimeout)
 	defer cancel() // nolint: errcheck
 	// Retry on remote call failures.
 	var endpoint string
@@ -380,9 +426,11 @@ func (c *Allocator) allocateFromRemoteCluster(gsa *allocationv1.GameServerAlloca
 			}
 			endpoint = addPort(ip)
 			c.loggerForGameServerAllocationKey("remote-allocation").WithField("request", request).WithField("endpoint", endpoint).Debug("forwarding allocation request")
+			span.AddEvent("forward_remote_allocation", trace.WithAttributes(attribute.String("endpoint", endpoint)))
 			allocationResponse, err = c.remoteAllocationCallback(ctx, endpoint, dialOpts, request)
 			if err != nil {
 				c.baseLogger.WithError(err).Error("remote allocation failed")
+				span.AddEvent("remote_allocation_error", trace.WithAttributes(attribute.String("error", err.Error())))
 				// If there are multiple endpoints for the allocator connection and the current one is
 				// failing, try the next endpoint. Otherwise, return the error response.
 				if (i + 1) < len(connectionInfo.AllocationEndpoints) {
@@ -457,10 +505,19 @@ func (c *Allocator) getClientCertificates(namespace, secretName string) (clientC
 func (c *Allocator) allocate(ctx context.Context, gsa *allocationv1.GameServerAllocation) (*agonesv1.GameServer, error) {
 	// creates an allocation request. This contains the requested GameServerAllocation, as well as the
 	// channel we expect the return values to come back for this GameServerAllocation
-	req := request{gsa: gsa, response: make(chan response)}
+	req := request{gsa: gsa, response: make(chan response, 1)}
+	pendingMetrics := c.newMetrics(ctx)
+	pendingMetrics.setRequest(gsa)
 
-	// this pushes the request into the batching process
-	c.pendingRequests <- req
+	// attempt to enqueue the request while honoring context cancellation
+	select {
+	case c.pendingRequests <- req:
+		// enqueued successfully
+		pendingMetrics.recordPendingRequestsGauge(len(c.pendingRequests))
+	case <-ctx.Done():
+		pendingMetrics.recordPendingRequestsGauge(len(c.pendingRequests))
+		return nil, ErrTotalTimeoutExceeded
+	}
 
 	select {
 	case res := <-req.response: // wait for the batch to be completed
@@ -663,8 +720,20 @@ func (c *Allocator) applyAllocationToGameServer(ctx context.Context, mp allocati
 		}
 	}
 
+	tracer := otel.Tracer("agones.dev/agones/allocator")
+	ctx, span := tracer.Start(ctx, "allocator.k8s_update_allocated", trace.WithSpanKind(trace.SpanKindInternal))
+	span.SetAttributes(
+		attribute.String("gameserver.namespace", gs.ObjectMeta.Namespace),
+		attribute.String("gameserver.name", gs.ObjectMeta.Name),
+		attribute.String("allocation.namespace", gsa.Namespace),
+		attribute.String("allocation.name", gsa.Name),
+	)
+	defer span.End()
+
 	gsUpdate, updateErr := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(ctx, gs, metav1.UpdateOptions{})
 	if updateErr != nil {
+		span.RecordError(updateErr)
+		span.SetStatus(otelcodes.Error, updateErr.Error())
 		return gsUpdate, updateErr
 	}
 
@@ -713,10 +782,7 @@ func Retry(backoff wait.Backoff, fn func() error) error {
 
 // newMetrics creates a new gsa latency recorder.
 func (c *Allocator) newMetrics(ctx context.Context) *metrics {
-	ctx, err := tag.New(ctx, latencyTags...)
-	if err != nil {
-		c.baseLogger.WithError(err).Warn("failed to tag latency recorder.")
-	}
+	// tags removed; using OTel attributes inside metrics implementation
 	return &metrics{
 		ctx:              ctx,
 		gameServerLister: c.allocationCache.gameServerLister,

@@ -35,13 +35,16 @@ import (
 	"agones.dev/agones/pkg/gameserverallocations"
 	"agones.dev/agones/pkg/gameservers"
 	"agones.dev/agones/pkg/metrics"
+	"agones.dev/agones/pkg/otelctx"
 	"agones.dev/agones/pkg/util/fswatch"
 	"github.com/heptiolabs/healthcheck"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
-	"go.opencensus.io/plugin/ocgrpc"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -73,7 +76,7 @@ const (
 const (
 	httpPortFlag                     = "http-port"
 	grpcPortFlag                     = "grpc-port"
-	enableStackdriverMetricsFlag     = "stackdriver-exporter"
+	enableStackdriverMetricsFlag     = "stackdriver-exporter" // deprecated: kept for compatibility
 	enablePrometheusMetricsFlag      = "prometheus-exporter"
 	projectIDFlag                    = "gcp-project-id"
 	stackdriverLabels                = "stackdriver-labels"
@@ -95,7 +98,7 @@ func parseEnvFlags() config {
 	viper.SetDefault(apiServerSustainedQPSFlag, 400)
 	viper.SetDefault(apiServerBurstQPSFlag, 500)
 	viper.SetDefault(enablePrometheusMetricsFlag, true)
-	viper.SetDefault(enableStackdriverMetricsFlag, false)
+	viper.SetDefault(enableStackdriverMetricsFlag, true) // enable OTLP by default
 	viper.SetDefault(projectIDFlag, "")
 	viper.SetDefault(stackdriverLabels, "")
 	viper.SetDefault(mTLSDisabledFlag, false)
@@ -110,8 +113,8 @@ func parseEnvFlags() config {
 	pflag.Int32(grpcPortFlag, viper.GetInt32(grpcPortFlag), "Port to listen on for gRPC requests")
 	pflag.Int32(apiServerSustainedQPSFlag, viper.GetInt32(apiServerSustainedQPSFlag), "Maximum sustained queries per second to send to the API server")
 	pflag.Int32(apiServerBurstQPSFlag, viper.GetInt32(apiServerBurstQPSFlag), "Maximum burst queries per second to send to the API server")
-	pflag.Bool(enablePrometheusMetricsFlag, viper.GetBool(enablePrometheusMetricsFlag), "Flag to activate metrics of Agones. Can also use PROMETHEUS_EXPORTER env variable.")
-	pflag.Bool(enableStackdriverMetricsFlag, viper.GetBool(enableStackdriverMetricsFlag), "Flag to activate stackdriver monitoring metrics for Agones. Can also use STACKDRIVER_EXPORTER env variable.")
+	pflag.Bool(enablePrometheusMetricsFlag, viper.GetBool(enablePrometheusMetricsFlag), "Enable Prometheus metrics endpoint.")
+	pflag.Bool(enableStackdriverMetricsFlag, viper.GetBool(enableStackdriverMetricsFlag), "Enable OTLP metrics exporter (uses OTEL_* envs).")
 	pflag.String(projectIDFlag, viper.GetString(projectIDFlag), "GCP ProjectID used for Stackdriver, if not specified ProjectID from Application Default Credentials would be used. Can also use GCP_PROJECT_ID env variable.")
 	pflag.String(stackdriverLabels, viper.GetString(stackdriverLabels), "A set of default labels to add to all stackdriver metrics generated. By default metadata are automatically added using Kubernetes API and GCP metadata enpoint.")
 	pflag.Bool(mTLSDisabledFlag, viper.GetBool(mTLSDisabledFlag), "Flag to enable/disable mTLS in the allocator.")
@@ -132,6 +135,8 @@ func parseEnvFlags() config {
 	runtime.Must(viper.BindEnv(apiServerBurstQPSFlag))
 	runtime.Must(viper.BindEnv(enablePrometheusMetricsFlag))
 	runtime.Must(viper.BindEnv(enableStackdriverMetricsFlag))
+	// Also honor OTEL_SDK_DISABLED to disable all telemetry
+	runtime.Must(viper.BindEnv("OTEL_SDK_DISABLED"))
 	runtime.Must(viper.BindEnv(projectIDFlag))
 	runtime.Must(viper.BindEnv(stackdriverLabels))
 	runtime.Must(viper.BindEnv(mTLSDisabledFlag))
@@ -221,16 +226,23 @@ func main() {
 	healthserver := &httpserver.Server{Logger: logger}
 	var health healthcheck.Handler
 
+	// VERY HACK: 나중에 위로 올려야 함
+	useOtel := os.Getenv("OTEL_SDK_DISABLED") != "true"
+
 	metricsConf := metrics.Config{
-		Stackdriver:       conf.Stackdriver,
+		OTLP:              useOtel,
 		PrometheusMetrics: conf.PrometheusMetrics,
 		GCPProjectID:      conf.GCPProjectID,
-		StackdriverLabels: conf.StackdriverLabels,
+		OTLPLabels:        conf.StackdriverLabels,
 	}
 	health, closer := metrics.SetupMetrics(metricsConf, healthserver)
 	defer closer()
 
-	metrics.SetReportingPeriod(conf.PrometheusMetrics, conf.Stackdriver)
+	// Initialize tracing export (OTLP) if enabled
+	traceCloser := metrics.SetupTracing(metricsConf)
+	defer traceCloser()
+
+	metrics.SetReportingPeriod(conf.PrometheusMetrics, useOtel)
 
 	kubeClient, agonesClient, err := getClients(conf)
 	if err != nil {
@@ -348,7 +360,9 @@ func runMux(listenCtx context.Context, workerCtx context.Context, h *serviceHand
 		panic(err)
 	}
 
-	runHTTP(listenCtx, workerCtx, h, httpPort, grpcHandlerFunc(grpcServer, mux))
+	// Wrap the HTTP mux with otelhttp so incoming HTTP headers propagate context.
+	wrapped := otelhttp.NewHandler(grpcHandlerFunc(grpcServer, mux), "allocator.http")
+	runHTTP(listenCtx, workerCtx, h, httpPort, wrapped)
 }
 
 func runREST(listenCtx context.Context, workerCtx context.Context, h *serviceHandler, httpPort int) {
@@ -369,6 +383,9 @@ func runHTTP(listenCtx context.Context, workerCtx context.Context, h *serviceHan
 		cfg.ClientAuth = tls.RequireAnyClientCert
 		cfg.VerifyPeerCertificate = h.verifyClientCertificate
 	}
+
+	// opentelemetry tracing 지원 추가
+	handler = otelhttp.NewHandler(handler, "allocator.http")
 
 	// Create a Server instance to listen on the http port with the TLS config.
 	server := &http.Server{
@@ -447,11 +464,13 @@ func newServiceHandler(ctx context.Context, kubeClient kubernetes.Interface, ago
 
 	h := serviceHandler{
 		allocationCallback: func(gsa *allocationv1.GameServerAllocation) (k8sruntime.Object, error) {
+			// Use the request context when available via the Allocate method, otherwise fall back
 			return allocator.Allocate(ctx, gsa)
 		},
 		mTLSDisabled:              mTLSDisabled,
 		tlsDisabled:               tlsDisabled,
 		grpcUnallocatedStatusCode: grpcUnallocatedStatusCode,
+		allocator:                 allocator,
 	}
 
 	kubeInformerFactory.Start(ctx.Done())
@@ -495,11 +514,11 @@ func readTLSCert() (*tls.Certificate, error) {
 // serving gRPC and REST over an HTTP multiplexer.
 // Current options are opencensus stats handler.
 func (h *serviceHandler) getMuxServerOptions() []grpc.ServerOption {
-	// Add options for  OpenCensus stats handler to enable stats and tracing.
+	// Add options for OpenTelemetry gRPC stats handler to enable metrics and tracing.
 	// The keepalive options are useful for efficiency purposes (keeping a single connection alive
 	// instead of constantly recreating connections), when placing the Agones allocator behind load balancers.
 	return []grpc.ServerOption{
-		grpc.StatsHandler(&ocgrpc.ServerHandler{}),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             1 * time.Minute,
 			PermitWithoutStream: true,
@@ -515,11 +534,11 @@ func (h *serviceHandler) getMuxServerOptions() []grpc.ServerOption {
 // only serving gRPC requests.
 // Current options are TLS certs and opencensus stats handler.
 func (h *serviceHandler) getGRPCServerOptions() []grpc.ServerOption {
-	// Add options for  OpenCensus stats handler to enable stats and tracing.
+	// Add options for OpenTelemetry gRPC stats handler to enable metrics and tracing.
 	// The keepalive options are useful for efficiency purposes (keeping a single connection alive
 	// instead of constantly recreating connections), when placing the Agones allocator behind load balancers.
 	opts := []grpc.ServerOption{
-		grpc.StatsHandler(&ocgrpc.ServerHandler{}),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             1 * time.Minute,
 			PermitWithoutStream: true,
@@ -594,6 +613,21 @@ func getClients(ctlConfig config) (*kubernetes.Clientset, *versioned.Clientset, 
 		return nil, nil, errors.New("Could not create in cluster config")
 	}
 
+	// Instrument underlying transport with OpenTelemetry and inject current request context
+	config.WrapTransport = func(rt http.RoundTripper) http.RoundTripper {
+		base := otelhttp.NewTransport(rt)
+		return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			// inject trace context if exists
+			if ctx, ok := otelctx.GetContext(); ok {
+				spanCtx := trace.SpanContextFromContext(ctx)
+				if spanCtx.IsValid() {
+					req = req.WithContext(trace.ContextWithSpanContext(req.Context(), spanCtx))
+				}
+			}
+			return base.RoundTrip(req)
+		})
+	}
+
 	config.QPS = float32(ctlConfig.APIServerSustainedQPS)
 	config.Burst = ctlConfig.APIServerBurstQPS
 
@@ -610,6 +644,12 @@ func getClients(ctlConfig config) (*kubernetes.Clientset, *versioned.Clientset, 
 	}
 	return kubeClient, agonesClient, nil
 }
+
+// roundTripperFunc adapts a function to http.RoundTripper.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+// RoundTrip implements http.RoundTripper.
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func getCACertPool(path string) (*x509.CertPool, error) {
 	// Add all certificates under client-certs path because there could be multiple clusters
@@ -653,32 +693,38 @@ type serviceHandler struct {
 	tlsDisabled  bool
 
 	grpcUnallocatedStatusCode codes.Code
+
+	// allocator is used to call into the allocation path with the inbound request context
+	allocator *gameserverallocations.Allocator
 }
 
 // Allocate implements the Allocate gRPC method definition
-func (h *serviceHandler) Allocate(_ context.Context, in *pb.AllocationRequest) (*pb.AllocationResponse, error) {
-	logger.WithField("request", in).Infof("allocation request received.")
-	gsa := converters.ConvertAllocationRequestToGSA(in)
-	gsa.ApplyDefaults()
-	resultObj, err := h.allocationCallback(gsa)
-	if err != nil {
-		logger.WithField("gsa", gsa).WithError(err).Error("allocation failed")
-		return nil, err
-	}
+func (h *serviceHandler) Allocate(ctx context.Context, in *pb.AllocationRequest) (*pb.AllocationResponse, error) {
+	return otelctx.WithContext2(ctx, func() (*pb.AllocationResponse, error) {
+		logger.WithField("request", in).Infof("allocation request received.")
+		gsa := converters.ConvertAllocationRequestToGSA(in)
+		gsa.ApplyDefaults()
+		// Ensure downstream uses inbound request context
+		resultObj, err := h.allocator.Allocate(ctx, gsa)
+		if err != nil {
+			logger.WithField("gsa", gsa).WithError(err).Error("allocation failed")
+			return nil, err
+		}
 
-	if s, ok := resultObj.(*metav1.Status); ok {
-		return nil, status.Errorf(codes.Code(s.Code), s.Message, resultObj)
-	}
+		if s, ok := resultObj.(*metav1.Status); ok {
+			return nil, status.Errorf(codes.Code(s.Code), s.Message, resultObj)
+		}
 
-	allocatedGsa, ok := resultObj.(*allocationv1.GameServerAllocation)
-	if !ok {
-		logger.Errorf("internal server error - Bad GSA format %v", resultObj)
-		return nil, status.Errorf(codes.Internal, "internal server error- Bad GSA format %v", resultObj)
-	}
-	response, err := converters.ConvertGSAToAllocationResponse(allocatedGsa, h.grpcUnallocatedStatusCode)
-	logger.WithField("response", response).WithError(err).Infof("allocation response is being sent")
+		allocatedGsa, ok := resultObj.(*allocationv1.GameServerAllocation)
+		if !ok {
+			logger.Errorf("internal server error - Bad GSA format %v", resultObj)
+			return nil, status.Errorf(codes.Internal, "internal server error- Bad GSA format %v", resultObj)
+		}
+		response, err := converters.ConvertGSAToAllocationResponse(allocatedGsa, h.grpcUnallocatedStatusCode)
+		logger.WithField("response", response).WithError(err).Infof("allocation response is being sent")
+		return response, err
+	})
 
-	return response, err
 }
 
 // grpcCodeFromHTTPStatus converts an HTTP status code to the corresponding gRPC status code.

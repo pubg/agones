@@ -37,7 +37,6 @@ import (
 	"github.com/heptiolabs/healthcheck"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"go.opencensus.io/tag"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	extclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
@@ -799,10 +798,6 @@ func aggregateLists(aggListStatus map[string]agonesv1.AggregatedListStatus,
 
 // newMetrics creates a new gss latency recorder.
 func (c *Controller) newMetrics(ctx context.Context) *metrics {
-	ctx, err := tag.New(ctx, latencyTags...)
-	if err != nil {
-		c.baseLogger.WithError(err).Warn("failed to tag latency recorder.")
-	}
 	return &metrics{
 		ctx:              ctx,
 		gameServerLister: c.gameServerLister,

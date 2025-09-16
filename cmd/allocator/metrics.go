@@ -13,17 +13,12 @@
 // limitations under the License.
 package main
 
-import (
-	"go.opencensus.io/plugin/ocgrpc"
-	"go.opencensus.io/stats/view"
-)
+// OpenTelemetry instrumentation for gRPC is configured in main; no metric view registration needed.
 
 func init() {
-	registerMetricViews()
+	// No-op: OpenCensus views removed. OpenTelemetry instrumentation is initialized elsewhere.
 }
 
 func registerMetricViews() {
-	if err := view.Register(ocgrpc.DefaultServerViews...); err != nil {
-		logger.WithError(err).Error("could not register view")
-	}
+	// No-op retained for backward compatibility.
 }

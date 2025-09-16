@@ -33,8 +33,8 @@ import (
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/tag"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/labels"
@@ -177,46 +177,40 @@ func (c *Controller) recordFleetAutoScalerChanges(old, next interface{}) {
 		return
 	}
 
-	ctx, _ := tag.New(context.Background(), tag.Upsert(keyName, fas.Name),
-		tag.Upsert(keyFleetName, fas.Spec.FleetName), tag.Upsert(keyNamespace, fas.Namespace))
+	attrs := []attribute.KeyValue{
+		attribute.String(keyName, fas.Name),
+		attribute.String(keyFleetName, fas.Spec.FleetName),
+		attribute.String(keyNamespace, fas.Namespace),
+	}
 
-	ableToScale := 0
-	limited := 0
+	InitializeMetrics()
+	fasCurrentReplicasGauge.Record(context.Background(), int64(fas.Status.CurrentReplicas), metric.WithAttributes(attrs...))
+	fasDesiredReplicasGauge.Record(context.Background(), int64(fas.Status.DesiredReplicas), metric.WithAttributes(attrs...))
 	if fas.Status.AbleToScale {
-		ableToScale = 1
+		fasAbleToScaleGauge.Record(context.Background(), 1, metric.WithAttributes(attrs...))
+	} else {
+		fasAbleToScaleGauge.Record(context.Background(), 0, metric.WithAttributes(attrs...))
 	}
 	if fas.Status.ScalingLimited {
-		limited = 1
+		fasLimitedGauge.Record(context.Background(), 1, metric.WithAttributes(attrs...))
+	} else {
+		fasLimitedGauge.Record(context.Background(), 0, metric.WithAttributes(attrs...))
 	}
-	// recording status
-	stats.Record(ctx,
-		fasCurrentReplicasStats.M(int64(fas.Status.CurrentReplicas)),
-		fasDesiredReplicasStats.M(int64(fas.Status.DesiredReplicas)),
-		fasAbleToScaleStats.M(int64(ableToScale)),
-		fasLimitedStats.M(int64(limited)))
 
-	// recording buffer policy
 	if fas.Spec.Policy.Buffer != nil {
-		// recording limits
-		RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "max")},
-			fasBufferLimitsCountStats.M(int64(fas.Spec.Policy.Buffer.MaxReplicas)))
-		RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "min")},
-			fasBufferLimitsCountStats.M(int64(fas.Spec.Policy.Buffer.MinReplicas)))
-
-		// recording size
+		// limits
+		fasBufferLimitsCountGauge.Record(context.Background(), int64(fas.Spec.Policy.Buffer.MaxReplicas), metric.WithAttributes(append(attrs, attribute.String(keyType, "max"))...))
+		fasBufferLimitsCountGauge.Record(context.Background(), int64(fas.Spec.Policy.Buffer.MinReplicas), metric.WithAttributes(append(attrs, attribute.String(keyType, "min"))...))
+		// size
 		if fas.Spec.Policy.Buffer.BufferSize.Type == intstr.String {
-			// as percentage
 			sizeString := fas.Spec.Policy.Buffer.BufferSize.StrVal
 			if sizeString != "" {
 				if size, err := strconv.Atoi(sizeString[:len(sizeString)-1]); err == nil {
-					RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "percentage")},
-						fasBufferSizeStats.M(int64(size)))
+					fasBufferSizeGauge.Record(context.Background(), int64(size), metric.WithAttributes(append(attrs, attribute.String(keyType, "percentage"))...))
 				}
 			}
 		} else {
-			// as count
-			RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "count")},
-				fasBufferSizeStats.M(int64(fas.Spec.Policy.Buffer.BufferSize.IntVal)))
+			fasBufferSizeGauge.Record(context.Background(), int64(fas.Spec.Policy.Buffer.BufferSize.IntVal), metric.WithAttributes(append(attrs, attribute.String(keyType, "count"))...))
 		}
 	}
 }
@@ -277,15 +271,14 @@ func (c *Controller) recordFleetRolloutPercentage(fleet *agonesv1.Fleet) {
 	currentReplicas := active.Status.Replicas
 	desiredReplicas := fleet.Spec.Replicas
 
-	ctx, _ := tag.New(context.Background(), tag.Upsert(keyName, fleet.Name), tag.Upsert(keyNamespace, fleet.GetNamespace()))
-
-	// Record current replicas count
-	RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "current_replicas")},
-		fleetRolloutPercentStats.M(int64(currentReplicas)))
-
-	// Record desired replicas count
-	RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "desired_replicas")},
-		fleetRolloutPercentStats.M(int64(desiredReplicas)))
+	// Record rollout percent
+	var percent int64
+	if desiredReplicas > 0 {
+		percent = int64((float64(currentReplicas) / float64(desiredReplicas)) * 100)
+	} else {
+		percent = 100
+	}
+	RecordFleetRolloutPercent(context.Background(), percent, fleet.Name, "percent", fleet.GetNamespace())
 }
 
 // filterGameServerSetByActive returns the active GameServerSet (or nil if it
@@ -365,52 +358,34 @@ func (c *Controller) resyncFleetAutoScaler() error {
 }
 
 func (c *Controller) recordFleetReplicas(fleetName, fleetNamespace string, total, allocated, ready, desired, reserved int32) {
-
-	ctx, _ := tag.New(context.Background(), tag.Upsert(keyName, fleetName), tag.Upsert(keyNamespace, fleetNamespace))
-
-	RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "total")},
-		fleetsReplicasCountStats.M(int64(total)))
-	RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "allocated")},
-		fleetsReplicasCountStats.M(int64(allocated)))
-	RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "ready")},
-		fleetsReplicasCountStats.M(int64(ready)))
-	RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "desired")},
-		fleetsReplicasCountStats.M(int64(desired)))
-	RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "reserved")},
-		fleetsReplicasCountStats.M(int64(reserved)))
+	RecordFleetReplicasCount(context.Background(), int64(total), "total", fleetName, fleetNamespace)
+	RecordFleetReplicasCount(context.Background(), int64(allocated), "allocated", fleetName, fleetNamespace)
+	RecordFleetReplicasCount(context.Background(), int64(ready), "ready", fleetName, fleetNamespace)
+	RecordFleetReplicasCount(context.Background(), int64(desired), "desired", fleetName, fleetNamespace)
+	RecordFleetReplicasCount(context.Background(), int64(reserved), "reserved", fleetName, fleetNamespace)
 }
 
 // nolint:dupl // Linter errors on lines are duplicate of recordLists
 func (c *Controller) recordCounters(fleetName, fleetNamespace string, counters map[string]agonesv1.AggregatedCounterStatus) {
-
-	ctx, _ := tag.New(context.Background(), tag.Upsert(keyName, fleetName), tag.Upsert(keyNamespace, fleetNamespace))
-
+	InitializeMetrics()
+	base := []attribute.KeyValue{attribute.String(keyName, fleetName), attribute.String(keyNamespace, fleetNamespace)}
 	for counter, counterStatus := range counters {
-		RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "allocated_count"), tag.Upsert(keyCounter, counter)},
-			fleetCountersStats.M(counterStatus.AllocatedCount))
-		RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "allocated_capacity"), tag.Upsert(keyCounter, counter)},
-			fleetCountersStats.M(counterStatus.AllocatedCapacity))
-		RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "total_count"), tag.Upsert(keyCounter, counter)},
-			fleetCountersStats.M(counterStatus.Count))
-		RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "total_capacity"), tag.Upsert(keyCounter, counter)},
-			fleetCountersStats.M(counterStatus.Capacity))
+		fleetCountersGauge.Record(context.Background(), counterStatus.AllocatedCount, metric.WithAttributes(append(base, attribute.String(keyType, "allocated_count"), attribute.String(keyCounter, counter))...))
+		fleetCountersGauge.Record(context.Background(), counterStatus.AllocatedCapacity, metric.WithAttributes(append(base, attribute.String(keyType, "allocated_capacity"), attribute.String(keyCounter, counter))...))
+		fleetCountersGauge.Record(context.Background(), counterStatus.Count, metric.WithAttributes(append(base, attribute.String(keyType, "total_count"), attribute.String(keyCounter, counter))...))
+		fleetCountersGauge.Record(context.Background(), counterStatus.Capacity, metric.WithAttributes(append(base, attribute.String(keyType, "total_capacity"), attribute.String(keyCounter, counter))...))
 	}
 }
 
 // nolint:dupl // Linter errors on lines are duplicate of recordCounters
 func (c *Controller) recordLists(fleetName, fleetNamespace string, lists map[string]agonesv1.AggregatedListStatus) {
-
-	ctx, _ := tag.New(context.Background(), tag.Upsert(keyName, fleetName), tag.Upsert(keyNamespace, fleetNamespace))
-
+	InitializeMetrics()
+	base := []attribute.KeyValue{attribute.String(keyName, fleetName), attribute.String(keyNamespace, fleetNamespace)}
 	for list, listStatus := range lists {
-		RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "allocated_count"), tag.Upsert(keyList, list)},
-			fleetListsStats.M(listStatus.AllocatedCount))
-		RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "allocated_capacity"), tag.Upsert(keyList, list)},
-			fleetListsStats.M(listStatus.AllocatedCapacity))
-		RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "total_count"), tag.Upsert(keyList, list)},
-			fleetListsStats.M(listStatus.Count))
-		RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyType, "total_capacity"), tag.Upsert(keyList, list)},
-			fleetListsStats.M(listStatus.Capacity))
+		fleetListsGauge.Record(context.Background(), listStatus.AllocatedCount, metric.WithAttributes(append(base, attribute.String(keyType, "allocated_count"), attribute.String(keyList, list))...))
+		fleetListsGauge.Record(context.Background(), listStatus.AllocatedCapacity, metric.WithAttributes(append(base, attribute.String(keyType, "allocated_capacity"), attribute.String(keyList, list))...))
+		fleetListsGauge.Record(context.Background(), listStatus.Count, metric.WithAttributes(append(base, attribute.String(keyType, "total_count"), attribute.String(keyList, list))...))
+		fleetListsGauge.Record(context.Background(), listStatus.Capacity, metric.WithAttributes(append(base, attribute.String(keyType, "total_capacity"), attribute.String(keyList, list))...))
 	}
 }
 
@@ -442,28 +417,32 @@ func (c *Controller) recordGameServerStatusChanges(old, next interface{}) {
 		oldGs.Status.Players != nil {
 
 		if newGs.Status.Players.Count != oldGs.Status.Players.Count {
-			RecordWithTags(context.Background(), []tag.Mutator{tag.Upsert(keyFleetName, fleetName),
-				tag.Upsert(keyName, newGs.GetName()), tag.Upsert(keyNamespace, newGs.GetNamespace())}, gameServerPlayerConnectedTotal.M(newGs.Status.Players.Count))
+			attrs := []attribute.KeyValue{attribute.String(keyFleetName, fleetName), attribute.String(keyName, newGs.GetName()), attribute.String(keyNamespace, newGs.GetNamespace())}
+			InitializeMetrics()
+			gameServerPlayerConnectedTotalGauge.Record(context.Background(), int64(newGs.Status.Players.Count), metric.WithAttributes(attrs...))
 		}
 
 		if newGs.Status.Players.Capacity-newGs.Status.Players.Count != oldGs.Status.Players.Capacity-oldGs.Status.Players.Count {
-			RecordWithTags(context.Background(), []tag.Mutator{tag.Upsert(keyFleetName, fleetName),
-				tag.Upsert(keyName, newGs.GetName()), tag.Upsert(keyNamespace, newGs.GetNamespace())}, gameServerPlayerCapacityTotal.M(newGs.Status.Players.Capacity-newGs.Status.Players.Count))
+			attrs := []attribute.KeyValue{attribute.String(keyFleetName, fleetName), attribute.String(keyName, newGs.GetName()), attribute.String(keyNamespace, newGs.GetNamespace())}
+			InitializeMetrics()
+			remaining := int64(newGs.Status.Players.Capacity - newGs.Status.Players.Count)
+			gameServerPlayerCapacityTotalGauge.Record(context.Background(), remaining, metric.WithAttributes(attrs...))
 		}
 
 	}
 
 	if newGs.Status.State != oldGs.Status.State {
-		RecordWithTags(context.Background(), []tag.Mutator{tag.Upsert(keyType, string(newGs.Status.State)),
-			tag.Upsert(keyFleetName, fleetName), tag.Upsert(keyNamespace, newGs.GetNamespace())}, gameServerTotalStats.M(1))
+		InitializeMetrics()
+		attrs := []attribute.KeyValue{attribute.String(keyType, string(newGs.Status.State)), attribute.String(keyFleetName, fleetName), attribute.String(keyNamespace, newGs.GetNamespace())}
+		gameServerTotalCounter.Add(context.Background(), 1, metric.WithAttributes(attrs...))
 
 		// Calculate the duration of the current state
 		duration, err := c.calcDuration(oldGs, newGs)
 		if err != nil {
 			c.logger.Warn(err.Error())
 		} else {
-			RecordWithTags(context.Background(), []tag.Mutator{tag.Upsert(keyType, string(oldGs.Status.State)),
-				tag.Upsert(keyFleetName, fleetName), tag.Upsert(keyNamespace, newGs.GetNamespace())}, gsStateDurationSec.M(duration))
+			attrs := []attribute.KeyValue{attribute.String(keyType, string(oldGs.Status.State)), attribute.String(keyFleetName, fleetName), attribute.String(keyNamespace, newGs.GetNamespace())}
+			gsStateDurationHistogram.Record(context.Background(), duration, metric.WithAttributes(attrs...))
 		}
 	}
 }
@@ -572,13 +551,12 @@ func (c *Controller) collectNodeCounts() {
 	}
 
 	nodes = removeSystemNodes(nodes)
-	RecordWithTags(context.Background(), []tag.Mutator{tag.Insert(keyEmpty, "true")},
-		nodesCountStats.M(int64(len(nodes)-len(gsPerNodes))))
-	RecordWithTags(context.Background(), []tag.Mutator{tag.Insert(keyEmpty, "false")},
-		nodesCountStats.M(int64(len(gsPerNodes))))
+	InitializeMetrics()
+	nodesCountGauge.Record(context.Background(), int64(len(nodes)-len(gsPerNodes)), metric.WithAttributes(attribute.String(keyEmpty, "true")))
+	nodesCountGauge.Record(context.Background(), int64(len(gsPerNodes)), metric.WithAttributes(attribute.String(keyEmpty, "false")))
 
 	for _, node := range nodes {
-		stats.Record(context.Background(), gsPerNodesCountStats.M(int64(gsPerNodes[node.Name])))
+		RecordGameServersPerNodeCount(context.Background(), int64(gsPerNodes[node.Name]), node.Name)
 	}
 }
 

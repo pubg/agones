@@ -18,8 +18,8 @@ import (
 	"context"
 
 	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/tag"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"k8s.io/apimachinery/pkg/util/errors"
 )
 
@@ -52,7 +52,7 @@ func (c GameServerCount) reset() {
 	}
 }
 
-// record counts the list of gameserver per status and fleet name and record it to OpenCensus
+// record counts the list of gameserver per status and fleet name and record it
 func (c GameServerCount) record(gameservers []*agonesv1.GameServer) error {
 	// Currently there is no way to remove a metric so we have to reset our values to zero
 	// so that statuses that have no count anymore are zeroed.
@@ -91,10 +91,14 @@ func (c GameServerCount) record(gameservers []*agonesv1.GameServer) error {
 				fleet.namespace = noneValue
 			}
 
-			if err := stats.RecordWithTags(context.Background(), []tag.Mutator{tag.Upsert(keyType, string(state)),
-				tag.Upsert(keyFleetName, fleet.name), tag.Upsert(keyNamespace, fleet.namespace)}, gameServerCountStats.M(count)); err != nil {
-				errs = append(errs, err)
+			attrs := []attribute.KeyValue{
+				attribute.String(keyType, string(state)),
+				attribute.String(keyFleetName, fleet.name),
+				attribute.String(keyNamespace, fleet.namespace),
 			}
+			// Use OpenTelemetry gauge/counter based on controller_metrics instruments
+			InitializeMetrics()
+			gameServerCountGauge.Record(context.Background(), count, metric.WithAttributes(attrs...))
 		}
 	}
 

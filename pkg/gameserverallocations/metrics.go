@@ -17,6 +17,7 @@ package gameserverallocations
 import (
 	"context"
 	"strconv"
+	"sync"
 	"time"
 
 	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
@@ -25,65 +26,83 @@ import (
 	mt "agones.dev/agones/pkg/metrics"
 	"agones.dev/agones/pkg/util/runtime"
 	"github.com/sirupsen/logrus"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/stats/view"
-	"go.opencensus.io/tag"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 )
 
 var (
 	logger = runtime.NewLoggerWithSource("metrics")
 
-	keyFleetName          = mt.MustTagKey("fleet_name")
-	keyClusterName        = mt.MustTagKey("cluster_name")
-	keyMultiCluster       = mt.MustTagKey("is_multicluster")
-	keyStatus             = mt.MustTagKey("status")
-	keySchedulingStrategy = mt.MustTagKey("scheduling_strategy")
+	// OpenTelemetry metrics
+	allocationMetricsOnce sync.Once
+	allocationMeter       metric.Meter
 
-	gameServerAllocationsLatency    = stats.Float64("gameserver_allocations/latency", "The duration of gameserver allocations", "s")
-	gameServerAllocationsRetryTotal = stats.Int64("gameserver_allocations/errors", "The errors of gameserver allocations", "1")
+	gameServerAllocationsLatencyHistogram     metric.Float64Histogram
+	gameServerAllocationsRetryHistogram       metric.Int64Histogram
+	gameServerAllocationsPendingRequestsGauge metric.Int64Gauge
 
-	stateViews = []*view.View{
-		{
-			Name:        "gameserver_allocations_duration_seconds",
-			Measure:     gameServerAllocationsLatency,
-			Description: "The distribution of gameserver allocation requests latencies.",
-			Aggregation: view.Distribution(0, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2, 3),
-			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
-		},
-		{
-			Name:        "gameserver_allocations_retry_total",
-			Measure:     gameServerAllocationsRetryTotal,
-			Description: "The count of gameserver allocation retry until it succeeds",
-			Aggregation: view.Distribution(1, 2, 3, 4, 5),
-			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
-		},
-	}
+	// Attribute keys
+	keyFleetName          = "fleet_name"
+	keyClusterName        = "cluster_name"
+	keyMultiCluster       = "is_multicluster"
+	keyStatus             = "status"
+	keySchedulingStrategy = "scheduling_strategy"
 )
 
-// register all our state views to OpenCensus
-func registerViews() {
-	for _, v := range stateViews {
-		if err := view.Register(v); err != nil {
-			logger.WithError(err).Error("could not register view")
+// InitializeAllocationMetrics initializes OpenTelemetry metrics for allocations
+func InitializeAllocationMetrics() {
+	allocationMetricsOnce.Do(func() {
+		allocationMeter = mt.GetMeter("agones.dev/agones/pkg/gameserverallocations")
+
+		var err error
+
+		gameServerAllocationsLatencyHistogram, err = allocationMeter.Float64Histogram(
+			"gameserver_allocations_duration_seconds",
+			metric.WithDescription("The distribution of gameserver allocation requests latencies"),
+			metric.WithUnit("s"),
+			metric.WithExplicitBucketBoundaries(0, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2, 3),
+		)
+		if err != nil {
+			logger.WithError(err).Error("failed to create gameserver allocations latency histogram")
 		}
-	}
+
+		gameServerAllocationsRetryHistogram, err = allocationMeter.Int64Histogram(
+			"gameserver_allocations_retry_total",
+			metric.WithDescription("The count of gameserver allocation retry until it succeeds"),
+			metric.WithUnit("1"),
+			metric.WithExplicitBucketBoundaries(1, 2, 3, 4, 5),
+		)
+		if err != nil {
+			logger.WithError(err).Error("failed to create gameserver allocations retry histogram")
+		}
+
+		gameServerAllocationsPendingRequestsGauge, err = allocationMeter.Int64Gauge(
+			"gameserver_allocations_pending_requests",
+			metric.WithDescription("Current number of pending allocation requests awaiting batch processing"),
+			metric.WithUnit("1"),
+		)
+		if err != nil {
+			logger.WithError(err).Error("failed to create gameserver allocations pending requests gauge")
+		}
+	})
 }
 
-// unregister views, this is only useful for tests as it trigger reporting.
-func unRegisterViews() {
-	for _, v := range stateViews {
-		view.Unregister(v)
-	}
+// register all our state views to OpenTelemetry
+func registerViews() {
+	InitializeAllocationMetrics()
 }
 
-// default set of tags for latency metric
-var latencyTags = []tag.Mutator{
-	tag.Insert(keyMultiCluster, "none"),
-	tag.Insert(keyClusterName, "none"),
-	tag.Insert(keySchedulingStrategy, "none"),
-	tag.Insert(keyFleetName, "none"),
-	tag.Insert(keyStatus, "none"),
+// unregister views - no-op with OpenTelemetry
+func unRegisterViews() {}
+
+// default set of attributes for latency metric
+var defaultAttributes = []attribute.KeyValue{
+	attribute.String(keyMultiCluster, "none"),
+	attribute.String(keyClusterName, "none"),
+	attribute.String(keySchedulingStrategy, "none"),
+	attribute.String(keyFleetName, "none"),
+	attribute.String(keyStatus, "none"),
 }
 
 type metrics struct {
@@ -91,46 +110,55 @@ type metrics struct {
 	gameServerLister listerv1.GameServerLister
 	logger           *logrus.Entry
 	start            time.Time
+	attributes       []attribute.KeyValue
 }
 
-// mutate the current set of metric tags
-func (r *metrics) mutate(m ...tag.Mutator) {
-	var err error
-	r.ctx, err = tag.New(r.ctx, m...)
-	if err != nil {
-		r.logger.WithError(err).Warn("failed to mutate request context.")
+// mutate the current set of metric attributes
+func (r *metrics) mutate(attrs ...attribute.KeyValue) {
+	// Update or add attributes
+	for _, newAttr := range attrs {
+		found := false
+		for i, existingAttr := range r.attributes {
+			if existingAttr.Key == newAttr.Key {
+				r.attributes[i] = newAttr
+				found = true
+				break
+			}
+		}
+		if !found {
+			r.attributes = append(r.attributes, newAttr)
+		}
 	}
 }
 
-// setStatus set the latency status tag.
+// setStatus set the latency status attribute.
 func (r *metrics) setStatus(status string) {
-	r.mutate(tag.Update(keyStatus, status))
+	r.mutate(attribute.String(keyStatus, status))
 }
 
-// setError set the latency status tag as error.
+// setError set the latency status attribute as error.
 func (r *metrics) setError() {
-	r.mutate(tag.Update(keyStatus, "error"))
+	r.mutate(attribute.String(keyStatus, "error"))
 }
 
-// setRequest set request metric tags.
+// setRequest set request metric attributes.
 func (r *metrics) setRequest(in *allocationv1.GameServerAllocation) {
-	tags := []tag.Mutator{
-		tag.Update(keySchedulingStrategy, string(in.Spec.Scheduling)),
+	attrs := []attribute.KeyValue{
+		attribute.String(keySchedulingStrategy, string(in.Spec.Scheduling)),
+		attribute.String(keyMultiCluster, strconv.FormatBool(in.Spec.MultiClusterSetting.Enabled)),
 	}
-
-	tags = append(tags, tag.Update(keyMultiCluster, strconv.FormatBool(in.Spec.MultiClusterSetting.Enabled)))
-	r.mutate(tags...)
+	r.mutate(attrs...)
 }
 
-// setResponse set response metric tags.
+// setResponse set response metric attributes.
 func (r *metrics) setResponse(o k8sruntime.Object) {
 	out, ok := o.(*allocationv1.GameServerAllocation)
 	if out == nil || !ok {
 		return
 	}
 	r.setStatus(string(out.Status.State))
-	var tags []tag.Mutator
-	// sets the fleet name tag if possible
+	var attrs []attribute.KeyValue
+	// sets the fleet name attribute if possible
 	if out.Status.State == allocationv1.GameServerAllocationAllocated && out.Status.Source == localAllocationSource {
 		gs, err := r.gameServerLister.GameServers(out.Namespace).Get(out.Status.GameServerName)
 		if err != nil {
@@ -139,19 +167,35 @@ func (r *metrics) setResponse(o k8sruntime.Object) {
 		}
 		fleetName := gs.Labels[agonesv1.FleetNameLabel]
 		if fleetName != "" {
-			tags = append(tags, tag.Update(keyFleetName, fleetName))
+			attrs = append(attrs, attribute.String(keyFleetName, fleetName))
 		}
 	}
-	r.mutate(tags...)
+	r.mutate(attrs...)
 }
 
 // record the current allocation latency.
 func (r *metrics) record() {
-	stats.Record(r.ctx, gameServerAllocationsLatency.M(time.Since(r.start).Seconds()))
+	InitializeAllocationMetrics()
+	duration := time.Since(r.start).Seconds()
+	gameServerAllocationsLatencyHistogram.Record(r.ctx, duration, metric.WithAttributes(r.attributes...))
 }
 
 // record the current allocation retry rate.
 func (r *metrics) recordAllocationRetrySuccess(ctx context.Context, retryCount int) {
-	mt.RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyStatus, "Success")},
-		gameServerAllocationsRetryTotal.M(int64(retryCount)))
+	InitializeAllocationMetrics()
+	attrs := []attribute.KeyValue{
+		attribute.String(keyStatus, "Success"),
+	}
+	gameServerAllocationsRetryHistogram.Record(ctx, int64(retryCount), metric.WithAttributes(attrs...))
+}
+
+func (r *metrics) recordPendingRequestsGauge(depth int) {
+	if r == nil {
+		return
+	}
+	InitializeAllocationMetrics()
+	if gameServerAllocationsPendingRequestsGauge == nil {
+		return
+	}
+	gameServerAllocationsPendingRequestsGauge.Record(r.ctx, int64(depth), metric.WithAttributes(r.attributes...))
 }

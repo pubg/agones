@@ -34,7 +34,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opencensus.io/stats/view"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -45,7 +44,7 @@ func TestRegisterPrometheusExporter(t *testing.T) {
 	resetMetrics()
 	registry := prometheus.NewRegistry()
 
-	handler, err := RegisterPrometheusExporter(registry)
+	handler, _, err := RegisterPrometheusExporter(registry)
 	assert.NoError(t, err, "RegisterPrometheusExporter should not return an error")
 	assert.NotNil(t, handler, "Handler should not be nil")
 
@@ -165,9 +164,9 @@ func TestSetupMetrics_StackdriverOnly_NoPanic(t *testing.T) {
 
 	// Config for Stackdriver metrics
 	conf := Config{
-		Stackdriver:       true,
-		GCPProjectID:      "fake-project",
-		StackdriverLabels: "env=dev",
+		OTLP:         true,
+		GCPProjectID: "fake-project",
+		OTLPLabels:   "env=dev",
 	}
 	server := &httpserver.Server{
 		Port:   "3001",
@@ -287,24 +286,26 @@ func setupGameServerStateDuration(_ *testing.T, ctrl *fakeController) {
 
 // getMetricNames returns all metric view names.
 func getMetricNames() []string {
-	var metricNames []string
-	for _, v := range stateViews {
-		metricName := "agones_" + v.Name
-
-		// Check if the aggregation type is Distribution
-		if v.Aggregation.Type == view.AggTypeDistribution {
-			// If it's a distribution, we append _bucket, _sum, and _count
-			metricNames = append(metricNames,
-				metricName+"_bucket",
-				metricName+"_sum",
-				metricName+"_count",
-			)
-		} else {
-			metricNames = append(metricNames, metricName)
-
-		}
+	return []string{
+		"agones_fleet_rollout_percent",
+		"agones_fleets_replicas_count",
+		"agones_fleet_autoscalers_buffer_limits",
+		"agones_fleet_autoscalers_buffer_size",
+		"agones_fleet_autoscalers_current_replicas_count",
+		"agones_fleet_autoscalers_desired_replicas_count",
+		"agones_fleet_autoscalers_able_to_scale",
+		"agones_fleet_autoscalers_limited",
+		"agones_fleet_counters",
+		"agones_fleet_lists",
+		"agones_gameservers_count",
+		"agones_gameservers_total",
+		"agones_gameserver_player_connected_total",
+		"agones_gameserver_player_capacity_total",
+		"agones_nodes_count",
+		"agones_gameservers_node_count",
+		"agones_gameserver_state_duration",
+		"agones_gameservers_node_count_histogram",
 	}
-	return metricNames
 }
 
 func collectMetricNames(resp *http.Response) map[string]bool {

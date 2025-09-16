@@ -30,7 +30,7 @@ import (
 	pb "agones.dev/agones/pkg/allocation/go"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	"go.opencensus.io/plugin/ocgrpc"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/grpc"
@@ -84,7 +84,7 @@ func main() {
 		log.Fatalf("net.Listen: %v", err)
 	}
 	opts := []grpc.ServerOption{
-		grpc.StatsHandler(&ocgrpc.ServerHandler{}),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             1 * time.Minute,
 			PermitWithoutStream: true,
@@ -271,7 +271,7 @@ func updateFailed(clusterName string, err error) {
 }
 
 func connectToAgonesCluster(ctx context.Context, clusterInfo *ClusterInfo) (*grpc.ClientConn, error) {
-	// nolint: staticcheck	
+	// nolint: staticcheck
 	conn, err := grpc.DialContext(ctx, fmt.Sprintf("%s:443", clusterInfo.Endpoint), grpc.WithTransportCredentials(cred))
 	if err != nil {
 		return nil, errors.Wrapf(err, "could not connect to %s with endpoint %s", clusterInfo.Name, clusterInfo.Endpoint)

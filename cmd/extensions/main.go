@@ -50,7 +50,7 @@ import (
 )
 
 const (
-	enableStackdriverMetricsFlag = "stackdriver-exporter"
+	enableStackdriverMetricsFlag = "stackdriver-exporter" // deprecated: kept for compatibility
 	stackdriverLabels            = "stackdriver-labels"
 	enablePrometheusMetricsFlag  = "prometheus-exporter"
 	projectIDFlag                = "gcp-project-id"
@@ -157,14 +157,18 @@ func main() {
 	var health healthcheck.Handler
 
 	metricsConf := metrics.Config{
-		Stackdriver:       ctlConf.Stackdriver,
+		OTLP:              ctlConf.Stackdriver,
 		PrometheusMetrics: ctlConf.PrometheusMetrics,
 		GCPProjectID:      ctlConf.GCPProjectID,
-		StackdriverLabels: ctlConf.StackdriverLabels,
+		OTLPLabels:        ctlConf.StackdriverLabels,
 	}
 
 	health, closer := metrics.SetupMetrics(metricsConf, server)
 	defer closer()
+
+	// Initialize tracing export (OTLP) if enabled
+	traceCloser := metrics.SetupTracing(metricsConf)
+	defer traceCloser()
 
 	podReady = true
 	health.AddReadinessCheck("agones-extensions", func() error {
@@ -228,7 +232,7 @@ func parseEnvFlags() config {
 	viper.SetDefault(allocationBatchWaitTime, 500*time.Millisecond)
 
 	viper.SetDefault(enablePrometheusMetricsFlag, true)
-	viper.SetDefault(enableStackdriverMetricsFlag, false)
+	viper.SetDefault(enableStackdriverMetricsFlag, true) // enable OTLP by default
 	viper.SetDefault(stackdriverLabels, "")
 
 	viper.SetDefault(projectIDFlag, "")
@@ -245,8 +249,8 @@ func parseEnvFlags() config {
 	pflag.String(certFileFlag, viper.GetString(certFileFlag), "Optional. Path to the crt file")
 	pflag.String(kubeconfigFlag, viper.GetString(kubeconfigFlag), "Optional. kubeconfig to run the controller out of the cluster. Only use it for debugging as webhook won't works.")
 
-	pflag.Bool(enablePrometheusMetricsFlag, viper.GetBool(enablePrometheusMetricsFlag), "Flag to activate metrics of Agones. Can also use PROMETHEUS_EXPORTER env variable.")
-	pflag.Bool(enableStackdriverMetricsFlag, viper.GetBool(enableStackdriverMetricsFlag), "Flag to activate stackdriver monitoring metrics for Agones. Can also use STACKDRIVER_EXPORTER env variable.")
+	pflag.Bool(enablePrometheusMetricsFlag, viper.GetBool(enablePrometheusMetricsFlag), "Enable Prometheus metrics endpoint.")
+	pflag.Bool(enableStackdriverMetricsFlag, viper.GetBool(enableStackdriverMetricsFlag), "Enable OTLP metrics exporter (uses OTEL_* envs).")
 	pflag.String(stackdriverLabels, viper.GetString(stackdriverLabels), "A set of default labels to add to all stackdriver metrics generated. By default metadata are automatically added using Kubernetes API and GCP metadata enpoint.")
 
 	pflag.String(projectIDFlag, viper.GetString(projectIDFlag), "GCP ProjectID used for Stackdriver, if not specified ProjectID from Application Default Credentials would be used. Can also use GCP_PROJECT_ID env variable.")

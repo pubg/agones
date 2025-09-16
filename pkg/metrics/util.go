@@ -22,46 +22,64 @@ import (
 	"unicode/utf8"
 
 	"agones.dev/agones/pkg/util/runtime"
-	"contrib.go.opencensus.io/exporter/stackdriver"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/tag"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 var (
 	logger = runtime.NewLoggerWithSource("metrics")
 
-	keyName       = MustTagKey("name")
-	keyNamespace  = MustTagKey("namespace")
-	keyFleetName  = MustTagKey("fleet_name")
-	keyType       = MustTagKey("type")
-	keyStatusCode = MustTagKey("status_code")
-	keyVerb       = MustTagKey("verb")
-	keyEndpoint   = MustTagKey("endpoint")
-	keyEmpty      = MustTagKey("empty")
-	keyCounter    = MustTagKey("counter")
-	keyList       = MustTagKey("list")
+	keyName       = "name"
+	keyNamespace  = "namespace"
+	keyFleetName  = "fleet_name"
+	keyType       = "type"
+	keyStatusCode = "status_code"
+	keyVerb       = "verb"
+	keyEndpoint   = "endpoint"
+	keyEmpty      = "empty"
+	keyCounter    = "counter"
+	keyList       = "list"
 )
 
-// RecordWithTags records a metric value and tags
-func RecordWithTags(ctx context.Context, mutators []tag.Mutator, ms ...stats.Measurement) {
-	if err := stats.RecordWithTags(ctx, mutators, ms...); err != nil {
-		logger.WithError(err).Warn("error while recoding stats")
-	}
+// RecordCounter records a counter metric with attributes
+func RecordCounter(ctx context.Context, counter metric.Int64Counter, value int64, attrs ...attribute.KeyValue) {
+	counter.Add(ctx, value, metric.WithAttributes(attrs...))
 }
 
-// MustTagKey creates a new `tag.Key` from a string, panic if the key is not a valid.
-func MustTagKey(key string) tag.Key {
-	t, err := tag.NewKey(key)
-	if err != nil {
-		panic(err)
-	}
-	return t
+// RecordUpDownCounter records an up/down counter metric with attributes
+func RecordUpDownCounter(ctx context.Context, counter metric.Int64UpDownCounter, value int64, attrs ...attribute.KeyValue) {
+	counter.Add(ctx, value, metric.WithAttributes(attrs...))
 }
 
-func parseLabels(s string) (*stackdriver.Labels, error) {
-	res := &stackdriver.Labels{}
+// RecordHistogram records a histogram metric with attributes
+func RecordHistogram(ctx context.Context, histogram metric.Int64Histogram, value int64, attrs ...attribute.KeyValue) {
+	histogram.Record(ctx, value, metric.WithAttributes(attrs...))
+}
+
+// RecordGauge records a gauge metric with attributes
+func RecordGauge(ctx context.Context, gauge metric.Int64Gauge, value int64, attrs ...attribute.KeyValue) {
+	gauge.Record(ctx, value, metric.WithAttributes(attrs...))
+}
+
+// GetMeter returns the global meter for the given name
+func GetMeter(name string) metric.Meter {
+	return otel.Meter(name)
+}
+
+// CreateAttributes creates OpenTelemetry attributes from key-value pairs
+func CreateAttributes(tags map[string]string) []attribute.KeyValue {
+	attrs := make([]attribute.KeyValue, 0, len(tags))
+	for k, v := range tags {
+		attrs = append(attrs, attribute.String(k, v))
+	}
+	return attrs
+}
+
+func parseOTLPLabels(s string) ([]attribute.KeyValue, error) {
+	var attributes []attribute.KeyValue
 	if s == "" {
-		return res, nil
+		return attributes, nil
 	}
 	pairs := strings.Split(s, ",")
 	for _, p := range pairs {
@@ -88,7 +106,7 @@ func parseLabels(s string) (*stackdriver.Labels, error) {
 			return nil, fmt.Errorf("invalid value: %s, must be a valid utf-8 string", value)
 		}
 
-		res.Set(key, value, "")
+		attributes = append(attributes, attribute.String(key, value))
 	}
-	return res, nil
+	return attributes, nil
 }

@@ -282,7 +282,7 @@ func TestParseLabels(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
-			res, err := parseLabels(tc.labels)
+			res, err := parseOTLPLabels(tc.labels)
 
 			if tc.err != "" {
 				require.Error(t, err)

@@ -19,6 +19,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -109,6 +110,18 @@ func NewServerMux() *gwruntime.ServeMux {
 					DiscardUnknown: true,
 				},
 			},
+		}),
+		// TODO: 실제로 필요한지 아닌지 검증 필요함
+		// Ensure trace context headers are forwarded/exposed to handlers as HTTP headers
+		// Allow common tracing headers to be forwarded as gRPC metadata when needed.
+		gwruntime.WithIncomingHeaderMatcher(func(key string) (string, bool) {
+			switch strings.ToLower(key) {
+			case "traceparent", "tracestate", "b3",
+				"x-b3-traceid", "x-b3-spanid", "x-b3-parentspanid", "x-b3-sampled", "x-b3-flags":
+				return key, true
+			default:
+				return gwruntime.DefaultHeaderMatcher(key)
+			}
 		}),
 	)
 	return mux
