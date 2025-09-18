@@ -40,10 +40,26 @@ var (
 	keyStatus             = mt.MustTagKey("status")
 	keySchedulingStrategy = mt.MustTagKey("scheduling_strategy")
 
-	gameServerAllocationsLatency    = stats.Float64("gameserver_allocations/latency", "The duration of gameserver allocations", "s")
-	gameServerAllocationsRetryTotal = stats.Int64("gameserver_allocations/errors", "The errors of gameserver allocations", "1")
+	gameServerAllocationsPendingRequests = stats.Int64("gameserver_allocations/pending_requests", "The number of gameserver allocation pending requests", "1")
+	gameServerAllocationsEnqueueDuration = stats.Float64("gameserver_allocations/enqueue_duration", "The duration of time to enqueue allocation request to pendingRequests", "s")
+	gameServerAllocationsLatency         = stats.Float64("gameserver_allocations/latency", "The duration of gameserver allocations", "s")
+	gameServerAllocationsRetryTotal      = stats.Int64("gameserver_allocations/errors", "The errors of gameserver allocations", "1")
 
 	stateViews = []*view.View{
+		{
+			Name:        "gameserver_allocations_pending_requests",
+			Measure:     gameServerAllocationsPendingRequests,
+			Description: "The number of gameserver allocation pending requests",
+			Aggregation: view.LastValue(),
+			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
+		},
+		{
+			Name:        "gameserver_allocations_enqueue_duration_seconds",
+			Measure:     gameServerAllocationsEnqueueDuration,
+			Description: "The distribution of time to enqueue allocation request to pendingRequests",
+			Aggregation: view.Distribution(0, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 5, 10, 15, 20, 30, 60),
+			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
+		},
 		{
 			Name:        "gameserver_allocations_duration_seconds",
 			Measure:     gameServerAllocationsLatency,
@@ -154,4 +170,14 @@ func (r *metrics) record() {
 func (r *metrics) recordAllocationRetrySuccess(ctx context.Context, retryCount int) {
 	mt.RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyStatus, "Success")},
 		gameServerAllocationsRetryTotal.M(int64(retryCount)))
+}
+
+// record the enqueue duration for allocation request.
+func (r *metrics) recordEnqueueDuration(enqueueStart, enqueueEnd time.Time) {
+	stats.Record(r.ctx, gameServerAllocationsEnqueueDuration.M(enqueueEnd.Sub(enqueueStart).Seconds()))
+}
+
+// record the current pending requests value.
+func (r *metrics) recordPendingRequests(pendingCount int64) {
+	stats.Record(r.ctx, gameServerAllocationsPendingRequests.M(pendingCount))
 }

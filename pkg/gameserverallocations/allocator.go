@@ -469,6 +469,8 @@ func (c *Allocator) allocate(ctx context.Context, gsa *allocationv1.GameServerAl
 	case <-ctx.Done():
 		return nil, ErrTotalTimeoutExceeded
 	case c.pendingRequests <- req:
+		metrics := c.newMetrics(ctx)
+		metrics.recordPendingRequests(int64(len(c.pendingRequests)))
 	}
 
 	select {
