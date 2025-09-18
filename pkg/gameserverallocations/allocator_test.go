@@ -561,11 +561,11 @@ func TestAllocatorRunLocalAllocations(t *testing.T) {
 		require.Len(t, errs, 0)
 
 		// line up 3 in a batch
-		j1 := request{gsa: gsa.DeepCopy(), response: make(chan response)}
+		j1 := request{ctx: context.Background(), gsa: gsa.DeepCopy(), response: make(chan response)}
 		a.pendingRequests <- j1
-		j2 := request{gsa: gsa.DeepCopy(), response: make(chan response)}
+		j2 := request{ctx: context.Background(), gsa: gsa.DeepCopy(), response: make(chan response)}
 		a.pendingRequests <- j2
-		j3 := request{gsa: gsa.DeepCopy(), response: make(chan response)}
+		j3 := request{ctx: context.Background(), gsa: gsa.DeepCopy(), response: make(chan response)}
 		a.pendingRequests <- j3
 
 		go a.ListenAndAllocate(ctx, 3)
@@ -617,7 +617,7 @@ func TestAllocatorRunLocalAllocations(t *testing.T) {
 		errs := gsa.Validate()
 		require.Len(t, errs, 0)
 
-		j1 := request{gsa: gsa.DeepCopy(), response: make(chan response)}
+		j1 := request{ctx: context.Background(), gsa: gsa.DeepCopy(), response: make(chan response)}
 		a.pendingRequests <- j1
 
 		go a.ListenAndAllocate(ctx, 3)
@@ -784,17 +784,17 @@ func TestAllocatorRunLocalAllocationsCountsAndLists(t *testing.T) {
 			},
 		}}
 
-	j1 := request{gsa: gsaDescending.DeepCopy(), response: make(chan response)}
+	j1 := request{ctx: context.Background(), gsa: gsaDescending.DeepCopy(), response: make(chan response)}
 	a.pendingRequests <- j1
-	j2 := request{gsa: gsaAscending.DeepCopy(), response: make(chan response)}
+	j2 := request{ctx: context.Background(), gsa: gsaAscending.DeepCopy(), response: make(chan response)}
 	a.pendingRequests <- j2
-	j3 := request{gsa: gsaDistributed.DeepCopy(), response: make(chan response)}
+	j3 := request{ctx: context.Background(), gsa: gsaDistributed.DeepCopy(), response: make(chan response)}
 	a.pendingRequests <- j3
-	j4 := request{gsa: gsaListDescending.DeepCopy(), response: make(chan response)}
+	j4 := request{ctx: context.Background(), gsa: gsaListDescending.DeepCopy(), response: make(chan response)}
 	a.pendingRequests <- j4
-	j5 := request{gsa: gsaListAscending.DeepCopy(), response: make(chan response)}
+	j5 := request{ctx: context.Background(), gsa: gsaListAscending.DeepCopy(), response: make(chan response)}
 	a.pendingRequests <- j5
-	j6 := request{gsa: gsaListDistributed.DeepCopy(), response: make(chan response)}
+	j6 := request{ctx: context.Background(), gsa: gsaListDistributed.DeepCopy(), response: make(chan response)}
 	a.pendingRequests <- j6
 
 	go a.ListenAndAllocate(ctx, 5)
@@ -859,6 +859,7 @@ func TestControllerAllocationUpdateWorkers(t *testing.T) {
 		}
 		r := response{
 			request: request{
+				ctx:      context.Background(),
 				gsa:      &allocationv1.GameServerAllocation{},
 				response: make(chan response),
 			},
@@ -905,6 +906,7 @@ func TestControllerAllocationUpdateWorkers(t *testing.T) {
 		}
 		r = response{
 			request: request{
+				ctx:      context.Background(),
 				gsa:      &allocationv1.GameServerAllocation{},
 				response: make(chan response),
 			},
@@ -940,6 +942,7 @@ func TestControllerAllocationUpdateWorkers(t *testing.T) {
 
 		r := response{
 			request: request{
+				ctx:      context.Background(),
 				gsa:      &allocationv1.GameServerAllocation{},
 				response: make(chan response),
 			},
@@ -1080,6 +1083,51 @@ func TestAllocatorCreateRestClientError(t *testing.T) {
 		_, err := a.createRemoteClusterDialOption(defaultNs, connectionInfo)
 		assert.Nil(t, err)
 	})
+}
+
+// ensure allocate respects a cancelled context before enqueueing
+func TestAllocatorAllocateCancelledContext(t *testing.T) {
+	t.Parallel()
+	a, _ := newFakeAllocator()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := a.allocate(ctx, &allocationv1.GameServerAllocation{})
+	require.Error(t, err)
+	assert.Equal(t, ErrTotalTimeoutExceeded, err)
+}
+
+// ensure worker drops cancelled requests without responding and restores GS to cache
+func TestAllocationUpdateWorkersCancelledRequest(t *testing.T) {
+	t.Parallel()
+	a, _ := newFakeAllocator()
+	gs1 := &agonesv1.GameServer{ObjectMeta: metav1.ObjectMeta{Name: "gs1"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	r := response{
+		request: request{
+			ctx:      ctx,
+			gsa:      &allocationv1.GameServerAllocation{},
+			response: make(chan response),
+		},
+		gs: gs1,
+	}
+
+	updateQueue := a.allocationUpdateWorkers(context.Background(), 1)
+	go func() { updateQueue <- r }()
+
+	// no response expected
+	select {
+	case <-r.request.response:
+		require.FailNow(t, "unexpected response for cancelled request")
+	case <-time.After(50 * time.Millisecond):
+		// expected path
+	}
+
+	key, err := cache.MetaNamespaceKeyFunc(gs1)
+	require.NoError(t, err)
+	_, ok := a.allocationCache.cache.Load(key)
+	assert.True(t, ok)
 }
 
 // newFakeAllocator returns a fake allocator.

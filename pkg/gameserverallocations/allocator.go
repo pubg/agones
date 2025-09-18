@@ -115,6 +115,7 @@ type Allocator struct {
 
 // request is an async request for allocation
 type request struct {
+	ctx      context.Context
 	gsa      *allocationv1.GameServerAllocation
 	response chan response
 }
@@ -457,10 +458,18 @@ func (c *Allocator) getClientCertificates(namespace, secretName string) (clientC
 func (c *Allocator) allocate(ctx context.Context, gsa *allocationv1.GameServerAllocation) (*agonesv1.GameServer, error) {
 	// creates an allocation request. This contains the requested GameServerAllocation, as well as the
 	// channel we expect the return values to come back for this GameServerAllocation
-	req := request{gsa: gsa, response: make(chan response)}
+	req := request{
+		ctx:      ctx,
+		gsa:      gsa,
+		response: make(chan response, 1),
+	}
 
 	// this pushes the request into the batching process
-	c.pendingRequests <- req
+	select {
+	case <-ctx.Done():
+		return nil, ErrTotalTimeoutExceeded
+	case c.pendingRequests <- req:
+	}
 
 	select {
 	case res := <-req.response: // wait for the batch to be completed
@@ -515,6 +524,12 @@ func (c *Allocator) ListenAndAllocate(ctx context.Context, updateWorkerCount int
 	for {
 		select {
 		case req := <-c.pendingRequests:
+			select {
+			case <-req.ctx.Done():
+				continue
+			default:
+			}
+
 			// refresh the list after every 100 allocations made in a single batch
 			if requestCount >= maxBatchBeforeRefresh {
 				list = nil
@@ -592,6 +607,14 @@ func (c *Allocator) allocationUpdateWorkers(ctx context.Context, workerCount int
 			for {
 				select {
 				case res := <-updateQueue:
+					select {
+					case <-res.request.ctx.Done():
+						// put the GameServer back into the cache, so it's immediately around for re-allocation
+						c.allocationCache.AddGameServer(res.gs)
+						continue
+					default:
+					}
+
 					gs, err := c.applyAllocationToGameServer(ctx, res.request.gsa.Spec.MetaPatch, res.gs, res.request.gsa)
 					if err != nil {
 						if !k8serrors.IsConflict(errors.Cause(err)) {
