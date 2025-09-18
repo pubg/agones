@@ -459,8 +459,14 @@ func (c *Allocator) allocate(ctx context.Context, gsa *allocationv1.GameServerAl
 	// channel we expect the return values to come back for this GameServerAllocation
 	req := request{gsa: gsa, response: make(chan response)}
 
+	start := time.Now()
+
 	// this pushes the request into the batching process
 	c.pendingRequests <- req
+
+	metrics := c.newMetrics(ctx)
+	metrics.recordPendingRequests(int64(len(c.pendingRequests)))
+	metrics.recordEnqueueDuration(start, time.Now())
 
 	select {
 	case res := <-req.response: // wait for the batch to be completed
