@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	pb "agones.dev/agones/pkg/allocation/go"
 	"agones.dev/agones/pkg/apis"
 	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
 	allocationv1 "agones.dev/agones/pkg/apis/allocation/v1"
@@ -33,6 +34,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -1128,6 +1130,61 @@ func TestAllocationUpdateWorkersCancelledRequest(t *testing.T) {
 	require.NoError(t, err)
 	_, ok := a.allocationCache.cache.Load(key)
 	assert.True(t, ok)
+}
+
+// ensure remote allocation short-circuits when the caller context is cancelled
+func TestAllocatorRemoteAllocationCancelledContext(t *testing.T) {
+	t.Parallel()
+	a, m := newFakeAllocator()
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "remote-secret",
+			Namespace: defaultNs,
+		},
+		Data: map[string][]byte{
+			"tls.crt": clientCert,
+			"tls.key": clientKey,
+			"ca.crt":  clientCert,
+		},
+	}
+	require.NoError(t, m.KubeInformerFactory.Core().V1().Secrets().Informer().GetStore().Add(secret))
+
+	callCtxCh := make(chan context.Context, 1)
+	a.remoteAllocationCallback = func(callCtx context.Context, _ string, _ grpc.DialOption, _ *pb.AllocationRequest) (*pb.AllocationResponse, error) {
+		callCtxCh <- callCtx
+		<-callCtx.Done()
+		return nil, callCtx.Err()
+	}
+
+	connectionInfo := &multiclusterv1.ClusterConnectionInfo{
+		SecretName:          secret.ObjectMeta.Name,
+		Namespace:           secret.ObjectMeta.Namespace,
+		AllocationEndpoints: []string{"127.0.0.1"},
+	}
+	gsa := &allocationv1.GameServerAllocation{
+		ObjectMeta: metav1.ObjectMeta{Namespace: defaultNs},
+		Spec: allocationv1.GameServerAllocationSpec{
+			MultiClusterSetting: allocationv1.MultiClusterSetting{Enabled: true},
+		},
+	}
+
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	defer cancelReq()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := a.allocateFromRemoteCluster(reqCtx, gsa, connectionInfo, defaultNs)
+		errCh <- err
+	}()
+
+	callCtx := <-callCtxCh
+	cancelReq()
+	err := <-errCh
+	require.Equal(t, ErrTotalTimeoutExceeded, err)
+	select {
+	case <-callCtx.Done():
+	default:
+		require.Fail(t, "remote call context not cancelled")
+	}
 }
 
 // newFakeAllocator returns a fake allocator.

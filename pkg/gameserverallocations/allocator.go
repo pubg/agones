@@ -338,7 +338,7 @@ func (c *Allocator) applyMultiClusterAllocation(ctx context.Context, gsa *alloca
 				c.loggerForGameServerAllocation(gsaCopy).WithError(err).Error("self-allocation failed")
 			}
 		} else {
-			result, err = c.allocateFromRemoteCluster(gsa, connectionInfo, gsa.ObjectMeta.Namespace)
+			result, err = c.allocateFromRemoteCluster(ctx, gsa, connectionInfo, gsa.ObjectMeta.Namespace)
 			if err != nil {
 				c.loggerForGameServerAllocation(gsa).WithField("allocConnInfo", connectionInfo).WithError(err).Error("remote-allocation failed")
 			}
@@ -352,7 +352,7 @@ func (c *Allocator) applyMultiClusterAllocation(ctx context.Context, gsa *alloca
 
 // allocateFromRemoteCluster allocates gameservers from a remote cluster by making
 // an http call to allocation service in that cluster.
-func (c *Allocator) allocateFromRemoteCluster(gsa *allocationv1.GameServerAllocation, connectionInfo *multiclusterv1.ClusterConnectionInfo, namespace string) (*allocationv1.GameServerAllocation, error) {
+func (c *Allocator) allocateFromRemoteCluster(ctx context.Context, gsa *allocationv1.GameServerAllocation, connectionInfo *multiclusterv1.ClusterConnectionInfo, namespace string) (*allocationv1.GameServerAllocation, error) {
 	var allocationResponse *pb.AllocationResponse
 
 	// TODO: cache the client
@@ -368,20 +368,20 @@ func (c *Allocator) allocateFromRemoteCluster(gsa *allocationv1.GameServerAlloca
 	request.MultiClusterSetting.Enabled = false
 	request.Namespace = connectionInfo.Namespace
 
-	ctx, cancel := context.WithTimeout(context.Background(), c.totalRemoteAllocationTimeout)
+	remoteCtx, cancel := context.WithTimeout(ctx, c.totalRemoteAllocationTimeout)
 	defer cancel() // nolint: errcheck
 	// Retry on remote call failures.
 	var endpoint string
 	err = Retry(remoteAllocationRetry, func() error {
 		for i, ip := range connectionInfo.AllocationEndpoints {
 			select {
-			case <-ctx.Done():
+			case <-remoteCtx.Done():
 				return ErrTotalTimeoutExceeded
 			default:
 			}
 			endpoint = addPort(ip)
 			c.loggerForGameServerAllocationKey("remote-allocation").WithField("request", request).WithField("endpoint", endpoint).Debug("forwarding allocation request")
-			allocationResponse, err = c.remoteAllocationCallback(ctx, endpoint, dialOpts, request)
+			allocationResponse, err = c.remoteAllocationCallback(remoteCtx, endpoint, dialOpts, request)
 			if err != nil {
 				c.baseLogger.WithError(err).Error("remote allocation failed")
 				// If there are multiple endpoints for the allocator connection and the current one is
