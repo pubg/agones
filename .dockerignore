@@ -15,7 +15,7 @@
 # project specific
 .*
 /build
-/cmd
+# Removed blanket /cmd exclusion so command binaries can be built inside Docker builds
 /sdks/cpp/.build
 /sdks/cpp/.archives
 .idea
