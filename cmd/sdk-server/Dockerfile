@@ -12,14 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+FROM --platform=$BUILDPLATFORM golang:1.24 AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG TARGETOS
+ARG TARGETARCH
+ENV CGO_ENABLED=0
+RUN mkdir -p /out && GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags "-s -w" -o /out/sdk-server ./cmd/sdk-server
+
 FROM gcr.io/distroless/static-debian12:nonroot
-
-ARG ARCH=amd64
 WORKDIR /
-
-COPY ./bin/sdk-server.linux.$ARCH /sdk-server
-COPY ./bin/LICENSES .
-COPY ./bin/dependencies-src.tgz .
+COPY --from=builder /out/sdk-server /sdk-server
 
 USER nonroot:nonroot
 ENTRYPOINT ["/sdk-server"]
