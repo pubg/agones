@@ -60,14 +60,14 @@ var (
 			Name:        "gameserver_allocations_enqueue_duration_seconds",
 			Measure:     gameServerAllocationsEnqueueDuration,
 			Description: "The distribution of time to enqueue allocation request to pendingRequests",
-			Aggregation: view.Distribution(0, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 5, 10, 15, 20, 30, 60),
+			Aggregation: view.Distribution(0, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60),
 			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
 		},
 		{
 			Name:        "gameserver_allocations_duration_seconds",
 			Measure:     gameServerAllocationsLatency,
 			Description: "The distribution of gameserver allocation requests latencies.",
-			Aggregation: view.Distribution(0, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2, 3),
+			Aggregation: view.Distribution(0, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60),
 			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
 		},
 		{
