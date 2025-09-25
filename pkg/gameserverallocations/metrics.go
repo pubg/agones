@@ -44,6 +44,9 @@ var (
 	gameServerAllocationsEnqueueDuration = stats.Float64("gameserver_allocations/enqueue_duration", "The duration of time to enqueue allocation request to pendingRequests", "s")
 	gameServerAllocationsLatency         = stats.Float64("gameserver_allocations/latency", "The duration of gameserver allocations", "s")
 	gameServerAllocationsRetryTotal      = stats.Int64("gameserver_allocations/errors", "The errors of gameserver allocations", "1")
+	gameServerAllocationUpdateAttempts   = stats.Int64("gameserver_allocations/update_attempts", "The number of gameserver allocation update attempts", "1")
+	gameServerAllocationUpdateLatency    = stats.Float64("gameserver_allocations/update_duration", "The duration of time to update a gameserver allocation", "s")
+	gameServerAllocationUpdateTimeouts   = stats.Int64("gameserver_allocations/update_timeouts", "The number of gameserver allocation updates that timed out", "1")
 
 	stateViews = []*view.View{
 		{
@@ -72,6 +75,27 @@ var (
 			Measure:     gameServerAllocationsRetryTotal,
 			Description: "The count of gameserver allocation retry until it succeeds",
 			Aggregation: view.Distribution(1, 2, 3, 4, 5),
+			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
+		},
+		{
+			Name:        "gameserver_allocations_update_attempts_total",
+			Measure:     gameServerAllocationUpdateAttempts,
+			Description: "The count of gameserver allocation update attempts",
+			Aggregation: view.Count(),
+			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
+		},
+		{
+			Name:        "gameserver_allocations_update_duration_seconds",
+			Measure:     gameServerAllocationUpdateLatency,
+			Description: "The distribution of gameserver allocation update durations",
+			Aggregation: view.Distribution(0, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60),
+			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
+		},
+		{
+			Name:        "gameserver_allocations_update_timeouts_total",
+			Measure:     gameServerAllocationUpdateTimeouts,
+			Description: "The count of gameserver allocation updates that timed out",
+			Aggregation: view.Count(),
 			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
 		},
 	}
@@ -128,6 +152,11 @@ func (r *metrics) setError() {
 	r.mutate(tag.Update(keyStatus, "error"))
 }
 
+// setTimeout set the latency status tag as timeout.
+func (r *metrics) setTimeout() {
+	r.mutate(tag.Update(keyStatus, "timeout"))
+}
+
 // setRequest set request metric tags.
 func (r *metrics) setRequest(in *allocationv1.GameServerAllocation) {
 	tags := []tag.Mutator{
@@ -180,4 +209,16 @@ func (r *metrics) recordEnqueueDuration(enqueueStart, enqueueEnd time.Time) {
 // record the current pending requests value.
 func (r *metrics) recordPendingRequests(pendingCount int64) {
 	stats.Record(r.ctx, gameServerAllocationsPendingRequests.M(pendingCount))
+}
+
+func (r *metrics) recordAllocationUpdateAttempt() {
+	stats.Record(r.ctx, gameServerAllocationUpdateAttempts.M(1))
+}
+
+func (r *metrics) recordAllocationUpdateLatency(start, end time.Time) {
+	stats.Record(r.ctx, gameServerAllocationUpdateLatency.M(end.Sub(start).Seconds()))
+}
+
+func (r *metrics) recordAllocationUpdateTimeout() {
+	stats.Record(r.ctx, gameServerAllocationUpdateTimeouts.M(1))
 }

@@ -194,7 +194,12 @@ func (c *Allocator) Allocate(ctx context.Context, gsa *allocationv1.GameServerAl
 	latency := c.newMetrics(ctx)
 	defer func() {
 		if err != nil {
-			latency.setError()
+			switch {
+			case errors.Is(err, ErrTotalTimeoutExceeded):
+				latency.setTimeout()
+			default:
+				latency.setError()
+			}
 		}
 		latency.record()
 	}()
@@ -464,13 +469,18 @@ func (c *Allocator) allocate(ctx context.Context, gsa *allocationv1.GameServerAl
 		response: make(chan response, 1),
 	}
 
+	enqueue := c.newMetrics(ctx)
+	start := time.Now()
 	// this pushes the request into the batching process
 	select {
 	case <-ctx.Done():
+		enqueue.setStatus("timeout")
+		enqueue.recordEnqueueDuration(start, time.Now())
 		return nil, ErrTotalTimeoutExceeded
 	case c.pendingRequests <- req:
-		metrics := c.newMetrics(ctx)
-		metrics.recordPendingRequests(int64(len(c.pendingRequests)))
+		enqueue.setStatus("enqueued")
+		enqueue.recordPendingRequests(int64(len(c.pendingRequests)))
+		enqueue.recordEnqueueDuration(start, time.Now())
 	}
 
 	select {
@@ -617,7 +627,17 @@ func (c *Allocator) allocationUpdateWorkers(ctx context.Context, workerCount int
 					default:
 					}
 
-					gs, err := c.applyAllocationToGameServer(ctx, res.request.gsa.Spec.MetaPatch, res.gs, res.request.gsa)
+					updateMetrics := c.newMetrics(res.request.ctx)
+					updateMetrics.setRequest(res.request.gsa)
+					updateMetrics.recordAllocationUpdateAttempt()
+					updateStart := time.Now()
+
+					gs, err := c.applyAllocationToGameServer(res.request.ctx, res.request.gsa.Spec.MetaPatch, res.gs, res.request.gsa)
+
+					updateMetrics.recordAllocationUpdateLatency(updateStart, time.Now())
+					if goErrors.Is(res.request.ctx.Err(), context.DeadlineExceeded) {
+						updateMetrics.recordAllocationUpdateTimeout()
+					}
 					if err != nil {
 						if !k8serrors.IsConflict(errors.Cause(err)) {
 							// since we could not allocate, we should put it back
