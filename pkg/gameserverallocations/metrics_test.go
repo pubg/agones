@@ -42,6 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 )
 
 type mockGameServerLister struct {
@@ -73,6 +74,77 @@ func (s mockGameServerNamespaceLister) List(_ labels.Selector) (ret []*agonesv1.
 func resetMetrics() {
 	unRegisterViews()
 	registerViews()
+}
+
+func TestMatchingFleetNames(t *testing.T) {
+	gameServerSets := []*agonesv1.GameServerSet{
+		{ObjectMeta: metav1.ObjectMeta{Name: "gss-a", Labels: map[string]string{agonesv1.FleetNameLabel: "fleet-a"}}, Spec: agonesv1.GameServerSetSpec{Template: agonesv1.GameServerTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"mode": "dm", "version": "v1"}}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "gss-b", Labels: map[string]string{agonesv1.FleetNameLabel: "fleet-b"}}, Spec: agonesv1.GameServerSetSpec{Template: agonesv1.GameServerTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"mode": "dm", "version": "v2"}}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "gss-c", Labels: map[string]string{agonesv1.FleetNameLabel: "fleet-c"}}, Spec: agonesv1.GameServerSetSpec{Template: agonesv1.GameServerTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"mode": "br", "version": "v2"}}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "gss-b-old", Labels: map[string]string{agonesv1.FleetNameLabel: "fleet-b"}}, Spec: agonesv1.GameServerSetSpec{Template: agonesv1.GameServerTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"mode": "dm", "version": "v1"}}}}},
+	}
+	selectors := []allocationv1.GameServerSelector{
+		{LabelSelector: metav1.LabelSelector{MatchLabels: map[string]string{"mode": "dm"}}},
+		{LabelSelector: metav1.LabelSelector{MatchLabels: map[string]string{"version": "v2"}}},
+	}
+
+	names, err := matchingFleetNames(selectors, gameServerSets)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"fleet-a", "fleet-b", "fleet-c"}, names)
+
+	names, err = matchingFleetNames([]allocationv1.GameServerSelector{{
+		LabelSelector: metav1.LabelSelector{MatchLabels: map[string]string{agonesv1.FleetNameLabel: "fleet-b"}},
+	}}, gameServerSets)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"fleet-b"}, names)
+}
+
+func TestRecordAllocationPressure(t *testing.T) {
+	resetMetrics()
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	for _, gameServerSet := range []*agonesv1.GameServerSet{
+		{ObjectMeta: metav1.ObjectMeta{Name: "gss-a", Namespace: defaultNs, Labels: map[string]string{agonesv1.FleetNameLabel: "fleet-a"}}, Spec: agonesv1.GameServerSetSpec{Template: agonesv1.GameServerTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"mode": "dm"}}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "gss-b", Namespace: defaultNs, Labels: map[string]string{agonesv1.FleetNameLabel: "fleet-b"}}, Spec: agonesv1.GameServerSetSpec{Template: agonesv1.GameServerTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"mode": "dm"}}}}},
+	} {
+		require.NoError(t, indexer.Add(gameServerSet))
+	}
+	recorder := metrics{
+		ctx:                 context.Background(),
+		gameServerSetLister: gameserverv1.NewGameServerSetLister(indexer),
+		logger:              runtime.NewLoggerWithSource("metrics_test"),
+	}
+	gsa := &allocationv1.GameServerAllocation{
+		ObjectMeta: metav1.ObjectMeta{Namespace: defaultNs},
+		Spec: allocationv1.GameServerAllocationSpec{Selectors: []allocationv1.GameServerSelector{{
+			LabelSelector: metav1.LabelSelector{MatchLabels: map[string]string{"mode": "dm"}},
+		}}},
+	}
+
+	fleetNames := recorder.recordAllocationAttempt(gsa)
+	recorder.recordAllocationExhausted(gsa.Namespace, fleetNames)
+	gsa.Spec.Selectors[0].MatchLabels["mode"] = "missing"
+	recorder.recordAllocationAttempt(gsa)
+
+	assert.Equal(t, map[string]float64{"fleet-a": 0.5, "fleet-b": 0.5, "none": 1}, metricFleetValues(t, "gameserver_allocations_attempts_total"))
+	assert.Equal(t, map[string]float64{"fleet-a": 0.5, "fleet-b": 0.5}, metricFleetValues(t, "gameserver_allocations_exhausted_total"))
+}
+
+func metricFleetValues(t *testing.T, viewName string) map[string]float64 {
+	t.Helper()
+	rows, err := view.RetrieveData(viewName)
+	require.NoError(t, err)
+	values := make(map[string]float64, len(rows))
+	for _, row := range rows {
+		fleetName := ""
+		for _, metricTag := range row.Tags {
+			if metricTag.Key == keyFleetName {
+				fleetName = metricTag.Value
+				break
+			}
+		}
+		values[fleetName] = row.Data.(*view.SumData).Value
+	}
+	return values
 }
 
 func TestSetResponse(t *testing.T) {
@@ -164,6 +236,11 @@ func TestAllocationMetrics(t *testing.T) {
 	m.AgonesClient.AddReactor("list", "gameservers", func(_ k8stesting.Action) (bool, k8sruntime.Object, error) {
 		return true, &agonesv1.GameServerList{Items: gsList}, nil
 	})
+	m.AgonesClient.AddReactor("list", "gameserversets", func(_ k8stesting.Action) (bool, k8sruntime.Object, error) {
+		gameServerSet := f.GameServerSet()
+		gameServerSet.Name = f.Name + "-gss"
+		return true, &agonesv1.GameServerSetList{Items: []agonesv1.GameServerSet{*gameServerSet}}, nil
+	})
 
 	gsWatch := watch.NewFake()
 	m.AgonesClient.AddWatchReactor("gameservers", k8stesting.DefaultWatchReactor(gsWatch, nil))
@@ -194,9 +271,15 @@ func TestAllocationMetrics(t *testing.T) {
 	errs := gsa.Validate()
 	require.Len(t, errs, 0)
 
-	result, err := a.Allocate(ctxAlloc, &gsa)
+	result, err := a.Allocate(ctxAlloc, gsa.DeepCopy())
 	require.NoError(t, err)
 	require.NotNil(t, result)
+	result, err = a.Allocate(ctxAlloc, gsa.DeepCopy())
+	require.NoError(t, err)
+	require.Equal(t, allocationv1.GameServerAllocationUnAllocated, result.(*allocationv1.GameServerAllocation).Status.State)
+
+	assert.Equal(t, map[string]float64{f.Name: 2}, metricFleetValues(t, "gameserver_allocations_attempts_total"))
+	assert.Equal(t, map[string]float64{f.Name: 1}, metricFleetValues(t, "gameserver_allocations_exhausted_total"))
 
 	metricsURL := startMetricsServerForTest(t, server)
 

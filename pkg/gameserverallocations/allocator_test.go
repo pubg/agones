@@ -249,7 +249,7 @@ func TestAllocatorApplyAllocationToGameServer(t *testing.T) {
 		return true, gs, nil
 	})
 
-	allocator := NewAllocator(m.AgonesInformerFactory.Multicluster().V1().GameServerAllocationPolicies(),
+	allocator := NewAllocator(m.AgonesInformerFactory.Agones().V1().GameServerSets(), m.AgonesInformerFactory.Multicluster().V1().GameServerAllocationPolicies(),
 		m.KubeInformerFactory.Core().V1().Secrets(),
 		m.AgonesClient.AgonesV1(), m.KubeClient,
 		NewAllocationCache(m.AgonesInformerFactory.Agones().V1().GameServers(), gameservers.NewPerNodeCounter(m.KubeInformerFactory, m.AgonesInformerFactory), healthcheck.NewHandler()),
@@ -292,7 +292,7 @@ func TestAllocatorApplyAllocationToGameServerCountsListsActions(t *testing.T) {
 		return true, gs, nil
 	})
 
-	allocator := NewAllocator(m.AgonesInformerFactory.Multicluster().V1().GameServerAllocationPolicies(),
+	allocator := NewAllocator(m.AgonesInformerFactory.Agones().V1().GameServerSets(), m.AgonesInformerFactory.Multicluster().V1().GameServerAllocationPolicies(),
 		m.KubeInformerFactory.Core().V1().Secrets(),
 		m.AgonesClient.AgonesV1(), m.KubeClient,
 		NewAllocationCache(m.AgonesInformerFactory.Agones().V1().GameServers(), gameservers.NewPerNodeCounter(m.KubeInformerFactory, m.AgonesInformerFactory), healthcheck.NewHandler()),
@@ -436,7 +436,7 @@ func TestAllocationApplyAllocationError(t *testing.T) {
 		return true, nil, errors.New("failed to update")
 	})
 
-	allocator := NewAllocator(m.AgonesInformerFactory.Multicluster().V1().GameServerAllocationPolicies(),
+	allocator := NewAllocator(m.AgonesInformerFactory.Agones().V1().GameServerSets(), m.AgonesInformerFactory.Multicluster().V1().GameServerAllocationPolicies(),
 		m.KubeInformerFactory.Core().V1().Secrets(),
 		m.AgonesClient.AgonesV1(), m.KubeClient,
 		NewAllocationCache(m.AgonesInformerFactory.Agones().V1().GameServers(), gameservers.NewPerNodeCounter(m.KubeInformerFactory, m.AgonesInformerFactory), healthcheck.NewHandler()),
@@ -1127,6 +1127,7 @@ func newFakeAllocator() (*Allocator, agtesting.Mocks) {
 
 	counter := gameservers.NewPerNodeCounter(m.KubeInformerFactory, m.AgonesInformerFactory)
 	a := NewAllocator(
+		m.AgonesInformerFactory.Agones().V1().GameServerSets(),
 		m.AgonesInformerFactory.Multicluster().V1().GameServerAllocationPolicies(),
 		m.KubeInformerFactory.Core().V1().Secrets(),
 		m.AgonesClient.AgonesV1(),

@@ -77,6 +77,7 @@ func NewExtensions(apiServer *apiserver.APIServer,
 	}
 
 	c.allocator = NewAllocator(
+		agonesInformerFactory.Agones().V1().GameServerSets(),
 		agonesInformerFactory.Multicluster().V1().GameServerAllocationPolicies(),
 		kubeInformerFactory.Core().V1().Secrets(),
 		agonesClient.AgonesV1(),

@@ -508,6 +508,7 @@ func newServiceHandler(ctx context.Context, kubeClient kubernetes.Interface, ago
 	gsCounter := gameservers.NewPerNodeCounter(kubeInformerFactory, agonesInformerFactory)
 
 	allocator := gameserverallocations.NewAllocator(
+		agonesInformerFactory.Agones().V1().GameServerSets(),
 		agonesInformerFactory.Multicluster().V1().GameServerAllocationPolicies(),
 		kubeInformerFactory.Core().V1().Secrets(),
 		agonesClient.AgonesV1(),
