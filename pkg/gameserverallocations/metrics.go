@@ -16,6 +16,7 @@ package gameserverallocations
 
 import (
 	"context"
+	"sort"
 	"strconv"
 	"time"
 
@@ -28,6 +29,8 @@ import (
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -39,9 +42,12 @@ var (
 	keyMultiCluster       = mt.MustTagKey("is_multicluster")
 	keyStatus             = mt.MustTagKey("status")
 	keySchedulingStrategy = mt.MustTagKey("scheduling_strategy")
+	keyNamespace          = mt.MustTagKey("namespace")
 
-	gameServerAllocationsLatency    = stats.Float64("gameserver_allocations/latency", "The duration of gameserver allocations", "s")
-	gameServerAllocationsRetryTotal = stats.Int64("gameserver_allocations/errors", "The errors of gameserver allocations", "1")
+	gameServerAllocationsLatency        = stats.Float64("gameserver_allocations/latency", "The duration of gameserver allocations", "s")
+	gameServerAllocationsRetryTotal     = stats.Int64("gameserver_allocations/errors", "The errors of gameserver allocations", "1")
+	gameServerAllocationsAttemptTotal   = stats.Float64("gameserver_allocations/attempts", "The local allocation attempt pressure", "1")
+	gameServerAllocationsExhaustedTotal = stats.Float64("gameserver_allocations/exhausted", "The local allocation attempt pressure exhausted without an allocatable game server", "1")
 
 	stateViews = []*view.View{
 		{
@@ -57,6 +63,20 @@ var (
 			Description: "The count of gameserver allocation retry until it succeeds",
 			Aggregation: view.Distribution(1, 2, 3, 4, 5),
 			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
+		},
+		{
+			Name:        "gameserver_allocations_attempts_total",
+			Measure:     gameServerAllocationsAttemptTotal,
+			Description: "The local allocation attempt pressure, split evenly across Fleets with matching GameServerSet template labels.",
+			Aggregation: view.Sum(),
+			TagKeys:     []tag.Key{keyNamespace, keyFleetName},
+		},
+		{
+			Name:        "gameserver_allocations_exhausted_total",
+			Measure:     gameServerAllocationsExhaustedTotal,
+			Description: "The exhausted local allocation attempt pressure, split evenly across Fleets with matching GameServerSet template labels.",
+			Aggregation: view.Sum(),
+			TagKeys:     []tag.Key{keyNamespace, keyFleetName},
 		},
 	}
 )
@@ -87,10 +107,11 @@ var latencyTags = []tag.Mutator{
 }
 
 type metrics struct {
-	ctx              context.Context
-	gameServerLister listerv1.GameServerLister
-	logger           *logrus.Entry
-	start            time.Time
+	ctx                 context.Context
+	gameServerSetLister listerv1.GameServerSetLister
+	gameServerLister    listerv1.GameServerLister
+	logger              *logrus.Entry
+	start               time.Time
 }
 
 // mutate the current set of metric tags
@@ -154,4 +175,77 @@ func (r *metrics) record() {
 func (r *metrics) recordAllocationRetrySuccess(ctx context.Context, retryCount int) {
 	mt.RecordWithTags(ctx, []tag.Mutator{tag.Upsert(keyStatus, "Success")},
 		gameServerAllocationsRetryTotal.M(int64(retryCount)))
+}
+
+func (r *metrics) recordAllocationAttempt(gsa *allocationv1.GameServerAllocation) []string {
+	gameServerSets, err := r.gameServerSetLister.GameServerSets(gsa.Namespace).List(labels.Everything())
+	if err != nil {
+		r.logger.WithError(err).Warn("failed to list GameServerSets for allocation attempt metric")
+		r.recordFleetPressure(gameServerAllocationsAttemptTotal, gsa.Namespace, nil)
+		return nil
+	}
+
+	fleetNames, err := matchingFleetNames(gsa.Spec.Selectors, gameServerSets)
+	if err != nil {
+		r.logger.WithError(err).Warn("failed to match Fleets for allocation attempt metric")
+		fleetNames = nil
+	}
+	r.recordFleetPressure(gameServerAllocationsAttemptTotal, gsa.Namespace, fleetNames)
+	return fleetNames
+}
+
+func (r *metrics) recordAllocationExhausted(namespace string, fleetNames []string) {
+	r.recordFleetPressure(gameServerAllocationsExhaustedTotal, namespace, fleetNames)
+}
+
+func (r *metrics) recordFleetPressure(measure *stats.Float64Measure, namespace string, fleetNames []string) {
+	if len(fleetNames) == 0 {
+		fleetNames = []string{"none"}
+	}
+	weight := 1 / float64(len(fleetNames))
+	for _, fleetName := range fleetNames {
+		mt.RecordWithTags(r.ctx, []tag.Mutator{
+			tag.Upsert(keyNamespace, namespace),
+			tag.Upsert(keyFleetName, fleetName),
+		}, measure.M(weight))
+	}
+}
+
+func matchingFleetNames(selectors []allocationv1.GameServerSelector, gameServerSets []*agonesv1.GameServerSet) ([]string, error) {
+	matchers := make([]labels.Selector, 0, len(selectors))
+	for i := range selectors {
+		selector, err := metav1.LabelSelectorAsSelector(&selectors[i].LabelSelector)
+		if err != nil {
+			return nil, err
+		}
+		matchers = append(matchers, selector)
+	}
+
+	matched := make(map[string]struct{})
+	for _, gameServerSet := range gameServerSets {
+		fleetName := gameServerSet.Labels[agonesv1.FleetNameLabel]
+		if fleetName == "" {
+			continue
+		}
+		gameServerLabels := make(labels.Set, len(gameServerSet.Spec.Template.Labels)+2)
+		for key, value := range gameServerSet.Spec.Template.Labels {
+			gameServerLabels[key] = value
+		}
+		gameServerLabels[agonesv1.GameServerSetGameServerLabel] = gameServerSet.Name
+		gameServerLabels[agonesv1.FleetNameLabel] = fleetName
+
+		for _, selector := range matchers {
+			if selector.Matches(gameServerLabels) {
+				matched[fleetName] = struct{}{}
+				break
+			}
+		}
+	}
+
+	fleetNames := make([]string, 0, len(matched))
+	for fleetName := range matched {
+		fleetNames = append(fleetNames, fleetName)
+	}
+	sort.Strings(fleetNames)
+	return fleetNames, nil
 }
