@@ -272,9 +272,7 @@ func (c *Allocator) allocateFromLocalCluster(ctx context.Context, gsa *allocatio
 	retry := c.newMetrics(ctx)
 	fleetNames := retry.recordAllocationAttempt(gsa)
 	status := "error"
-	defer func() {
-		retry.recordMatchingFleets(gsa.Namespace, status, len(fleetNames))
-	}()
+	defer func() { retry.recordMatchingFleets(gsa.Namespace, status, len(fleetNames)) }()
 	retryCount := 0
 	err := Retry(allocationRetry, func() error {
 		var err error
@@ -298,7 +296,7 @@ func (c *Allocator) allocateFromLocalCluster(ctx context.Context, gsa *allocatio
 	case goErrors.Is(err, ErrNoGameServer):
 		status = string(allocationv1.GameServerAllocationUnAllocated)
 		gsa.Status.State = allocationv1.GameServerAllocationUnAllocated
-		retry.recordAllocationExhausted(gsa.Namespace, fleetNames)
+		retry.recordFleetPressure(gameServerAllocationsExhaustedTotal, gsa.Namespace, fleetNames)
 	case goErrors.Is(err, ErrGameServerUpdateConflict):
 		gsa.Status.State = allocationv1.GameServerAllocationUnAllocated
 	case goErrors.Is(err, ErrConflictInGameServerSelection):
