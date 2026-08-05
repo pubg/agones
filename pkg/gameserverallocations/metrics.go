@@ -16,7 +16,6 @@ package gameserverallocations
 
 import (
 	"context"
-	"sort"
 	"strconv"
 	"time"
 
@@ -202,10 +201,6 @@ func (r *metrics) recordAllocationAttempt(gsa *allocationv1.GameServerAllocation
 	return fleetNames
 }
 
-func (r *metrics) recordAllocationExhausted(namespace string, fleetNames []string) {
-	r.recordFleetPressure(gameServerAllocationsExhaustedTotal, namespace, fleetNames)
-}
-
 func (r *metrics) recordMatchingFleets(namespace, status string, count int) {
 	mt.RecordWithTags(r.ctx, []tag.Mutator{
 		tag.Upsert(keyNamespace, namespace),
@@ -261,6 +256,5 @@ func matchingFleetNames(selectors []allocationv1.GameServerSelector, gameServerS
 	for fleetName := range matched {
 		fleetNames = append(fleetNames, fleetName)
 	}
-	sort.Strings(fleetNames)
 	return fleetNames, nil
 }

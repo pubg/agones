@@ -90,7 +90,7 @@ func TestMatchingFleetNames(t *testing.T) {
 
 	names, err := matchingFleetNames(selectors, gameServerSets)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"fleet-a", "fleet-b", "fleet-c"}, names)
+	assert.ElementsMatch(t, []string{"fleet-a", "fleet-b", "fleet-c"}, names)
 
 	names, err = matchingFleetNames([]allocationv1.GameServerSelector{{
 		LabelSelector: metav1.LabelSelector{MatchLabels: map[string]string{agonesv1.FleetNameLabel: "fleet-b"}},
@@ -121,7 +121,7 @@ func TestRecordAllocationPressure(t *testing.T) {
 	}
 
 	fleetNames := recorder.recordAllocationAttempt(gsa)
-	recorder.recordAllocationExhausted(gsa.Namespace, fleetNames)
+	recorder.recordFleetPressure(gameServerAllocationsExhaustedTotal, gsa.Namespace, fleetNames)
 	gsa.Spec.Selectors[0].MatchLabels["mode"] = "missing"
 	recorder.recordAllocationAttempt(gsa)
 
