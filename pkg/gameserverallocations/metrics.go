@@ -48,6 +48,7 @@ var (
 	gameServerAllocationsRetryTotal     = stats.Int64("gameserver_allocations/errors", "The errors of gameserver allocations", "1")
 	gameServerAllocationsAttemptTotal   = stats.Float64("gameserver_allocations/attempts", "The local allocation attempt pressure", "1")
 	gameServerAllocationsExhaustedTotal = stats.Float64("gameserver_allocations/exhausted", "The local allocation attempt pressure exhausted without an allocatable game server", "1")
+	gameServerAllocationsMatchingFleets = stats.Int64("gameserver_allocations/matching_fleets", "The number of unique Fleets matching a local allocation attempt", "1")
 
 	stateViews = []*view.View{
 		{
@@ -77,6 +78,13 @@ var (
 			Description: "The exhausted local allocation attempt pressure, split evenly across Fleets with matching GameServerSet template labels.",
 			Aggregation: view.Sum(),
 			TagKeys:     []tag.Key{keyNamespace, keyFleetName},
+		},
+		{
+			Name:        "gameserver_allocations_matching_fleets",
+			Measure:     gameServerAllocationsMatchingFleets,
+			Description: "The distribution of unique Fleets matching a local allocation attempt.",
+			Aggregation: view.Distribution(0, 1, 2, 4, 8, 16),
+			TagKeys:     []tag.Key{keyNamespace, keyStatus},
 		},
 	}
 )
@@ -196,6 +204,13 @@ func (r *metrics) recordAllocationAttempt(gsa *allocationv1.GameServerAllocation
 
 func (r *metrics) recordAllocationExhausted(namespace string, fleetNames []string) {
 	r.recordFleetPressure(gameServerAllocationsExhaustedTotal, namespace, fleetNames)
+}
+
+func (r *metrics) recordMatchingFleets(namespace, status string, count int) {
+	mt.RecordWithTags(r.ctx, []tag.Mutator{
+		tag.Upsert(keyNamespace, namespace),
+		tag.Upsert(keyStatus, status),
+	}, gameServerAllocationsMatchingFleets.M(int64(count)))
 }
 
 func (r *metrics) recordFleetPressure(measure *stats.Float64Measure, namespace string, fleetNames []string) {
