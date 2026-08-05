@@ -31,7 +31,9 @@ import (
 	allocationv1 "agones.dev/agones/pkg/apis/allocation/v1"
 	multiclusterv1 "agones.dev/agones/pkg/apis/multicluster/v1"
 	getterv1 "agones.dev/agones/pkg/client/clientset/versioned/typed/agones/v1"
+	informerv1 "agones.dev/agones/pkg/client/informers/externalversions/agones/v1"
 	multiclusterinformerv1 "agones.dev/agones/pkg/client/informers/externalversions/multicluster/v1"
+	listerv1 "agones.dev/agones/pkg/client/listers/agones/v1"
 	multiclusterlisterv1 "agones.dev/agones/pkg/client/listers/multicluster/v1"
 	"agones.dev/agones/pkg/util/apiserver"
 	"agones.dev/agones/pkg/util/errors"
@@ -103,6 +105,8 @@ var remoteAllocationRetry = wait.Backoff{
 //nolint:govet // fieldalignment: struct alignment is not critical for our use case
 type Allocator struct {
 	baseLogger                   *logrus.Entry
+	gameServerSetLister          listerv1.GameServerSetLister
+	gameServerSetSynced          cache.InformerSynced
 	allocationPolicyLister       multiclusterlisterv1.GameServerAllocationPolicyLister
 	allocationPolicySynced       cache.InformerSynced
 	secretLister                 corev1lister.SecretLister
@@ -134,11 +138,13 @@ type response struct {
 }
 
 // NewAllocator creates an instance of Allocator
-func NewAllocator(policyInformer multiclusterinformerv1.GameServerAllocationPolicyInformer, secretInformer informercorev1.SecretInformer, gameServerGetter getterv1.GameServersGetter,
+func NewAllocator(gameServerSetInformer informerv1.GameServerSetInformer, policyInformer multiclusterinformerv1.GameServerAllocationPolicyInformer, secretInformer informercorev1.SecretInformer, gameServerGetter getterv1.GameServersGetter,
 	kubeClient kubernetes.Interface, allocationCache *AllocationCache, remoteAllocationTimeout time.Duration, totalRemoteAllocationTimeout time.Duration, batchWaitTime time.Duration,
 	listMaxCapacity int64) *Allocator {
 	ah := &Allocator{
 		pendingRequests:              make(chan request, maxBatchQueue),
+		gameServerSetLister:          gameServerSetInformer.Lister(),
+		gameServerSetSynced:          gameServerSetInformer.Informer().HasSynced,
 		allocationPolicyLister:       policyInformer.Lister(),
 		allocationPolicySynced:       policyInformer.Informer().HasSynced,
 		secretLister:                 secretInformer.Lister(),
@@ -192,7 +198,7 @@ func (c *Allocator) Run(ctx context.Context) error {
 // Sync waits for cache to sync
 func (c *Allocator) Sync(ctx context.Context) error {
 	c.baseLogger.Debug("Wait for Allocator cache sync")
-	if !cache.WaitForCacheSync(ctx.Done(), c.secretSynced, c.allocationPolicySynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), c.gameServerSetSynced, c.secretSynced, c.allocationPolicySynced) {
 		return c.errs.New("failed to wait for caches to sync")
 	}
 	return nil
@@ -264,6 +270,7 @@ func (c *Allocator) loggerForGameServerAllocation(gsa *allocationv1.GameServerAl
 func (c *Allocator) allocateFromLocalCluster(ctx context.Context, gsa *allocationv1.GameServerAllocation) (*allocationv1.GameServerAllocation, error) {
 	var gs *agonesv1.GameServer
 	retry := c.newMetrics(ctx)
+	fleetNames := retry.recordAllocationAttempt(gsa)
 	retryCount := 0
 	err := Retry(allocationRetry, func() error {
 		var err error
@@ -284,7 +291,10 @@ func (c *Allocator) allocateFromLocalCluster(ctx context.Context, gsa *allocatio
 	}
 
 	switch {
-	case goErrors.Is(err, ErrNoGameServer), goErrors.Is(err, ErrGameServerUpdateConflict):
+	case goErrors.Is(err, ErrNoGameServer):
+		gsa.Status.State = allocationv1.GameServerAllocationUnAllocated
+		retry.recordAllocationExhausted(gsa.Namespace, fleetNames)
+	case goErrors.Is(err, ErrGameServerUpdateConflict):
 		gsa.Status.State = allocationv1.GameServerAllocationUnAllocated
 	case goErrors.Is(err, ErrConflictInGameServerSelection):
 		gsa.Status.State = allocationv1.GameServerAllocationContention
@@ -740,10 +750,11 @@ func (c *Allocator) newMetrics(ctx context.Context) *metrics {
 		c.baseLogger.WithError(err).Warn("failed to tag latency recorder.")
 	}
 	return &metrics{
-		ctx:              ctx,
-		gameServerLister: c.allocationCache.gameServerLister,
-		logger:           c.baseLogger,
-		start:            time.Now(),
+		ctx:                 ctx,
+		gameServerSetLister: c.gameServerSetLister,
+		gameServerLister:    c.allocationCache.gameServerLister,
+		logger:              c.baseLogger,
+		start:               time.Now(),
 	}
 }
 

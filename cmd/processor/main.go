@@ -239,6 +239,7 @@ func main() {
 	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, defaultResync)
 	gsCounter := gameservers.NewPerNodeCounter(kubeInformerFactory, agonesInformerFactory)
 	allocator := gameserverallocations.NewAllocator(
+		agonesInformerFactory.Agones().V1().GameServerSets(),
 		agonesInformerFactory.Multicluster().V1().GameServerAllocationPolicies(),
 		kubeInformerFactory.Core().V1().Secrets(),
 		agonesClient.AgonesV1(),
