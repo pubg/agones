@@ -129,6 +129,24 @@ func TestRecordAllocationPressure(t *testing.T) {
 	assert.Equal(t, map[string]float64{"fleet-a": 0.5, "fleet-b": 0.5}, metricFleetValues(t, "gameserver_allocations_exhausted_total"))
 }
 
+func TestRecordMatchingFleets(t *testing.T) {
+	resetMetrics()
+	recorder := metrics{ctx: context.Background()}
+
+	recorder.recordMatchingFleets(defaultNs, string(allocationv1.GameServerAllocationAllocated), 3)
+	recorder.recordMatchingFleets(defaultNs, string(allocationv1.GameServerAllocationUnAllocated), 0)
+
+	distributions := metricDistributions(t, "gameserver_allocations_matching_fleets")
+	allocated := distributions[string(allocationv1.GameServerAllocationAllocated)]
+	assert.Equal(t, int64(1), allocated.Count)
+	assert.Equal(t, float64(3), allocated.Mean)
+	assert.Equal(t, []int64{0, 0, 1, 0, 0, 0}, allocated.CountPerBucket)
+	unallocated := distributions[string(allocationv1.GameServerAllocationUnAllocated)]
+	assert.Equal(t, int64(1), unallocated.Count)
+	assert.Equal(t, float64(0), unallocated.Mean)
+	assert.Equal(t, []int64{1, 0, 0, 0, 0, 0}, unallocated.CountPerBucket)
+}
+
 func metricFleetValues(t *testing.T, viewName string) map[string]float64 {
 	t.Helper()
 	rows, err := view.RetrieveData(viewName)
@@ -143,6 +161,24 @@ func metricFleetValues(t *testing.T, viewName string) map[string]float64 {
 			}
 		}
 		values[fleetName] = row.Data.(*view.SumData).Value
+	}
+	return values
+}
+
+func metricDistributions(t *testing.T, viewName string) map[string]*view.DistributionData {
+	t.Helper()
+	rows, err := view.RetrieveData(viewName)
+	require.NoError(t, err)
+	values := make(map[string]*view.DistributionData, len(rows))
+	for _, row := range rows {
+		group := ""
+		for _, metricTag := range row.Tags {
+			if metricTag.Key == keyStatus {
+				group = metricTag.Value
+				break
+			}
+		}
+		values[group] = row.Data.(*view.DistributionData)
 	}
 	return values
 }
@@ -280,6 +316,11 @@ func TestAllocationMetrics(t *testing.T) {
 
 	assert.Equal(t, map[string]float64{f.Name: 2}, metricFleetValues(t, "gameserver_allocations_attempts_total"))
 	assert.Equal(t, map[string]float64{f.Name: 1}, metricFleetValues(t, "gameserver_allocations_exhausted_total"))
+	distributions := metricDistributions(t, "gameserver_allocations_matching_fleets")
+	assert.Equal(t, int64(1), distributions[string(allocationv1.GameServerAllocationAllocated)].Count)
+	assert.Equal(t, float64(1), distributions[string(allocationv1.GameServerAllocationAllocated)].Mean)
+	assert.Equal(t, int64(1), distributions[string(allocationv1.GameServerAllocationUnAllocated)].Count)
+	assert.Equal(t, float64(1), distributions[string(allocationv1.GameServerAllocationUnAllocated)].Mean)
 
 	metricsURL := startMetricsServerForTest(t, server)
 

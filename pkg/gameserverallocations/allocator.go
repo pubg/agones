@@ -271,6 +271,10 @@ func (c *Allocator) allocateFromLocalCluster(ctx context.Context, gsa *allocatio
 	var gs *agonesv1.GameServer
 	retry := c.newMetrics(ctx)
 	fleetNames := retry.recordAllocationAttempt(gsa)
+	status := "error"
+	defer func() {
+		retry.recordMatchingFleets(gsa.Namespace, status, len(fleetNames))
+	}()
 	retryCount := 0
 	err := Retry(allocationRetry, func() error {
 		var err error
@@ -292,13 +296,16 @@ func (c *Allocator) allocateFromLocalCluster(ctx context.Context, gsa *allocatio
 
 	switch {
 	case goErrors.Is(err, ErrNoGameServer):
+		status = string(allocationv1.GameServerAllocationUnAllocated)
 		gsa.Status.State = allocationv1.GameServerAllocationUnAllocated
 		retry.recordAllocationExhausted(gsa.Namespace, fleetNames)
 	case goErrors.Is(err, ErrGameServerUpdateConflict):
 		gsa.Status.State = allocationv1.GameServerAllocationUnAllocated
 	case goErrors.Is(err, ErrConflictInGameServerSelection):
+		status = string(allocationv1.GameServerAllocationContention)
 		gsa.Status.State = allocationv1.GameServerAllocationContention
 	default:
+		status = string(allocationv1.GameServerAllocationAllocated)
 		gsa.ObjectMeta.Name = gs.ObjectMeta.Name
 		gsa.Status.State = allocationv1.GameServerAllocationAllocated
 		gsa.Status.GameServerName = gs.ObjectMeta.Name
