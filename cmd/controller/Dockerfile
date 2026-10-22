@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
+
+WORKDIR /src
+COPY . .
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -mod=vendor -trimpath -ldflags "-s -w -X agones.dev/agones/pkg.Version=$VERSION" -o /controller ./cmd/controller
+
 FROM gcr.io/distroless/static-debian13:nonroot
 
-ARG ARCH=amd64
 WORKDIR /
-
-COPY ./bin/controller.linux.$ARCH /controller
-COPY ./bin/LICENSES .
-COPY ./bin/dependencies-src.tgz .
+COPY --from=builder /controller /controller
 
 USER nonroot:nonroot
 ENTRYPOINT ["/controller"]
