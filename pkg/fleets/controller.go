@@ -385,6 +385,12 @@ func (c *Controller) applyDeploymentStrategy(ctx context.Context, fleet *agonesv
 		return fleet.Spec.Replicas, nil
 	}
 
+	// the rolling update keeps applying maxSurge after the inactive GameServerSets reach zero, so the
+	// surged GameServers are released gradually instead of in one step.
+	if fleet.Spec.Strategy.Type == appsv1.RollingUpdateDeploymentStrategyType {
+		return c.rollingUpdateDeployment(ctx, fleet, active, rest)
+	}
+
 	// if we do have `rest` but all their spec.replicas is zero, we can just do subtraction against whatever is allocated in `rest`.
 	if agonesv1.SumGameServerSets(rest, func(gsSet *agonesv1.GameServerSet) int32 {
 		return gsSet.Spec.Replicas
@@ -464,54 +470,40 @@ func (c *Controller) rollingUpdateDeployment(ctx context.Context, fleet *agonesv
 }
 
 // rollingUpdateActive applies the rolling update to the active GameServerSet
-// and returns what its replica value should be set to
+// and returns what its replica value should be set to.
+// It uses the same maxSurge budget before and after inactive GameServerSets reach zero desired
+// replicas. Existing targets may be retained above that budget, but cannot grow beyond it; the
+// Fleet target still limits retention when the Fleet is scaled down.
 func (c *Controller) rollingUpdateActive(fleet *agonesv1.Fleet, active *agonesv1.GameServerSet, rest []*agonesv1.GameServerSet) (int32, error) {
-	replicas := active.Spec.Replicas
-	// always leave room for Allocated GameServers
-	sumAllocated := agonesv1.SumGameServerSets(rest, func(gsSet *agonesv1.GameServerSet) int32 {
-		return gsSet.Status.AllocatedReplicas
-	})
-
-	// if the active spec replicas don't equal the active status replicas, this means we are
-	// in the middle of a rolling update, and should wait for it to complete.
-	if active.Spec.Replicas != active.Status.Replicas {
-		return replicas, nil
-	}
-
-	// if the current number replicas from the fleet is zero, the rolling update can be ignored
-	// and the cleanup stage will remove dangling GameServerSets
 	if fleet.Spec.Replicas == 0 {
 		return 0, nil
 	}
-
-	// if the active spec replicas are greater than or equal the fleet spec replicas, then we don't
-	// need to do another rolling update upwards.
-	if active.Spec.Replicas >= (fleet.Spec.Replicas - sumAllocated) {
-		return fleet.Spec.Replicas - sumAllocated, nil
+	// while the active GameServerSet is still creating GameServers, hold its current target so
+	// the GameServers already requested are neither removed nor topped up past the budget.
+	// Status above Spec is not waited on: Allocated GameServers can keep it there indefinitely.
+	if active.Spec.Replicas > active.Status.Replicas {
+		return fleet.UpperBoundReplicas(active.Spec.Replicas), nil
 	}
-
 	r, err := intstr.GetValueFromIntOrPercent(fleet.Spec.Strategy.RollingUpdate.MaxSurge, int(fleet.Spec.Replicas), true)
 	if err != nil {
 		return 0, errors.Wrapf(err, "error parsing MaxSurge value: %s", fleet.ObjectMeta.Name)
 	}
 	surge := int32(r)
-
-	// make sure we don't end up with more than the configured max surge
-	maxSurge := surge + fleet.Spec.Replicas
-	replicas = fleet.UpperBoundReplicas(replicas + surge)
-	total := agonesv1.SumGameServerSets(rest, func(gsSet *agonesv1.GameServerSet) int32 {
-		return gsSet.Status.Replicas
-	}) + replicas
-	if total > maxSurge {
-		replicas = fleet.LowerBoundReplicas(replicas - (total - maxSurge))
-	}
-
-	// make room for allocated game servers, but not over the fleet replica count
-	if replicas+sumAllocated > fleet.Spec.Replicas {
-		replicas = fleet.LowerBoundReplicas(fleet.Spec.Replicas - sumAllocated)
-	}
+	// count the GameServers an inactive GameServerSet is still creating (Spec above Status) as well
+	// as those it cannot remove because they are Allocated (Status above Spec).
+	restReplicas := agonesv1.SumGameServerSets(rest, func(gsSet *agonesv1.GameServerSet) int32 {
+		return max(gsSet.Spec.Replicas, gsSet.Status.Replicas)
+	})
+	blocked := agonesv1.SumGameServerSets(rest, func(gsSet *agonesv1.GameServerSet) int32 {
+		return gsSet.Status.AllocatedReplicas + gsSet.Status.ReservedReplicas
+	})
+	surged := fleet.LowerBoundReplicas(fleet.UpperBoundReplicas(fleet.Spec.Replicas + surge - restReplicas))
+	// Retain the current target without preventing an explicit Fleet scale down.
+	retained := max(min(active.Spec.Replicas, fleet.Spec.Replicas-blocked), 0)
+	replicas := max(retained, surged)
 
 	loggerForFleet(fleet, c.baseLogger).WithField("gameserverset", active.ObjectMeta.Name).WithField("replicas", replicas).
+		WithField("surge", surge).WithField("restReplicas", restReplicas).
 		Debug("applying rolling update to active gameserverset")
 
 	return replicas, nil

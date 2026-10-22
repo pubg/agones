@@ -1194,7 +1194,8 @@ func TestControllerApplyDeploymentStrategy(t *testing.T) {
 
 		replicas, err := c.applyDeploymentStrategy(context.Background(), f, f.GameServerSet(), []*agonesv1.GameServerSet{gsSet1})
 		require.NoError(t, err)
-		assert.Equal(t, int32(9), replicas)
+		// maxSurge leaves room for the Allocated GameServer
+		assert.Equal(t, int32(10), replicas)
 	})
 }
 
@@ -1403,7 +1404,7 @@ func TestControllerRollingUpdateDeploymentNoInactiveGSSNoErrors(t *testing.T) {
 
 	replicas, err := c.rollingUpdateDeployment(context.Background(), f, active, []*agonesv1.GameServerSet{})
 	assert.Nil(t, err)
-	assert.Equal(t, int32(25), replicas)
+	assert.Equal(t, int32(100), replicas)
 }
 
 // Test when replicas is negative value(0 replicas - 1 allocated = -1)
@@ -1453,8 +1454,9 @@ func TestControllerRollingUpdateDeploymentNegativeReplica(t *testing.T) {
 		return true, nil, errors.Errorf("error updating replicas for gameserverset for fleet %s", f.Name)
 	})
 
-	// assert the active gameserverset's replicas when active and inactive gameserversets exist
-	expected := f.Spec.Replicas - f.Status.AllocatedReplicas
+	// assert the active gameserverset's replicas when active and inactive gameserversets exist:
+	// maxSurge leaves room for the Allocated GameServer
+	expected := f.Spec.Replicas
 	replicas, err := c.rollingUpdateDeployment(context.Background(), f, active, []*agonesv1.GameServerSet{inactive})
 	f.Status.ReadyReplicas = replicas
 	assert.NoError(t, err)
@@ -1531,7 +1533,7 @@ func TestRollingUpdateOnReady(t *testing.T) {
 			expected: expected{
 				updated:              true,
 				inactiveSpecReplicas: 5,
-				replicas:             70,
+				replicas:             75,
 			},
 		},
 		"enough Ready GameServers - scale down rest GameServerSet to 0": {
@@ -1682,7 +1684,7 @@ func TestControllerRollingUpdateDeployment(t *testing.T) {
 
 			expected: expected{
 				inactiveSpecReplicas: 0,
-				replicas:             95,
+				replicas:             100,
 				updated:              true,
 			},
 		},
@@ -1724,7 +1726,7 @@ func TestControllerRollingUpdateDeployment(t *testing.T) {
 			inactiveStatusAllocationReplicas: 5,
 			expected: expected{
 				inactiveSpecReplicas: 0,
-				replicas:             70,
+				replicas:             75,
 				updated:              true,
 			},
 		},
@@ -1739,7 +1741,7 @@ func TestControllerRollingUpdateDeployment(t *testing.T) {
 			inactiveStatusAllocationReplicas: 90,
 			expected: expected{
 				inactiveSpecReplicas: 97,
-				replicas:             10,
+				replicas:             25,
 				updated:              true,
 			},
 		},
@@ -1754,7 +1756,7 @@ func TestControllerRollingUpdateDeployment(t *testing.T) {
 			inactiveStatusAllocationReplicas: 50,
 			expected: expected{
 				inactiveSpecReplicas: 0,
-				replicas:             50,
+				replicas:             75,
 				updated:              true,
 			},
 		},
