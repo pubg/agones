@@ -1,4 +1,4 @@
-name: Build Allocator Image
+name: Build Images
 
 on:
   push:
@@ -9,12 +9,14 @@ permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/agones-allocator
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [allocator, controller]
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/agones-${{ matrix.component }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -37,7 +39,7 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          file: cmd/allocator/Dockerfile
+          file: cmd/${{ matrix.component }}/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
