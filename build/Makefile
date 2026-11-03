@@ -145,6 +145,7 @@ push_processor_manifest = $(processor_amd64_tag)
 gomod_on = GO111MODULE=on
 
 go_version_flags = -ldflags "-X agones.dev/agones/pkg.Version=$(VERSION)"
+source_image_build_args = --build-arg VERSION=$(VERSION) --build-arg GO_BUILD_TAGS="$(GO_BUILD_TAGS)"
 DOCKER_RUN ?= docker run --rm $(common_mounts) -e "KUBECONFIG=/root/.kube/$(kubeconfig_file)" -e "$(gomod_on)" -w $(workdir_path) $(DOCKER_RUN_ARGS) $(build_tag)
 
 ifdef DOCKER_RUN
@@ -555,11 +556,12 @@ ifeq ($(WITH_ARM64), 1)
 build-controller-image: build-controller-image-arm64
 endif
 
-build-controller-image-amd64: $(ensure-build-image) build-controller-binary build-licenses build-required-src-dist
-	docker build $(agones_path)/cmd/controller/ --tag=$(controller_amd64_tag) $(DOCKER_BUILD_ARGS)
+# cmd/controller/Dockerfile builds from source, so it needs the repository root as context
+build-controller-image-amd64:
+	docker build $(agones_path) --file $(agones_path)/cmd/controller/Dockerfile $(source_image_build_args) --tag=$(controller_amd64_tag) $(DOCKER_BUILD_ARGS)
 # creating docker builder and then using that builder to build controller image in buildx command
-build-controller-image-arm64: $(ensure-build-image) build-controller-binary create-arm64-builder
-	docker buildx build --platform linux/arm64 --builder $(BUILDX_ARM64_BUILDER) --build-arg ARCH=arm64 $(agones_path)/cmd/controller/ --tag=$(controller_arm64_tag) $(DOCKER_BUILD_ARGS)
+build-controller-image-arm64: create-arm64-builder
+	docker buildx build --platform linux/arm64 --builder $(BUILDX_ARM64_BUILDER) $(agones_path) --file $(agones_path)/cmd/controller/Dockerfile $(source_image_build_args) --tag=$(controller_arm64_tag) $(DOCKER_BUILD_ARGS)
 
 # Build the debug image for the controller service
 build-controller-debug-image: $(ensure-build-image) build-controller-debug-binary build-licenses build-required-src-dist
@@ -755,11 +757,12 @@ ifeq ($(WITH_ARM64), 1)
 build-allocator-image: build-allocator-image-arm64
 endif
 
-build-allocator-image-amd64: $(ensure-build-image) build-allocator-binary build-licenses build-required-src-dist
-	docker build $(agones_path)/cmd/allocator/ --tag=$(allocator_amd64_tag) $(DOCKER_BUILD_ARGS)
+# cmd/allocator/Dockerfile builds from source, so it needs the repository root as context
+build-allocator-image-amd64:
+	docker build $(agones_path) --file $(agones_path)/cmd/allocator/Dockerfile $(source_image_build_args) --tag=$(allocator_amd64_tag) $(DOCKER_BUILD_ARGS)
 # creating docker builder and then using that builder to build allocator image in buildx command
-build-allocator-image-arm64: $(ensure-build-image) build-allocator-binary create-arm64-builder
-	docker buildx build --provenance false $(agones_path)/cmd/allocator/ --builder $(BUILDX_ARM64_BUILDER) --tag=$(allocator_arm64_tag) --build-arg ARCH=arm64 --platform linux/arm64 $(DOCKER_BUILD_ARGS)
+build-allocator-image-arm64: create-arm64-builder
+	docker buildx build --provenance false $(agones_path) --file $(agones_path)/cmd/allocator/Dockerfile --builder $(BUILDX_ARM64_BUILDER) $(source_image_build_args) --tag=$(allocator_arm64_tag) --platform linux/arm64 $(DOCKER_BUILD_ARGS)
 
 # Build the debug image for the allocator service
 build-allocator-debug-image: $(ensure-build-image) build-allocator-debug-binary build-licenses build-required-src-dist

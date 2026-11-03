@@ -16,7 +16,10 @@ package gameservers
 
 import (
 	"context"
+	"net"
 	"strings"
+	"sync"
+	"time"
 
 	"agones.dev/agones/pkg/apis/agones"
 	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
@@ -34,6 +37,7 @@ import (
 	k8sv1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -41,7 +45,14 @@ import (
 	corelisterv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/clock"
 )
+
+// externalIPMissingGracePeriod is how long a GameServer keeps its ExternalIP address while that
+// ExternalIP is missing from its Node. Azure cloud-node-manager can drop the ExternalIP from
+// Node.status.addresses for one 5 minute reconcile cycle while the public IP keeps working, so
+// this covers two consecutive failed cycles.
+const externalIPMissingGracePeriod = 15 * time.Minute
 
 // MigrationController watches for if a Pod is migrated/a maintenance
 // event happens on a node, and a Pod is recreated with a new Address for a
@@ -58,6 +69,16 @@ type MigrationController struct {
 	workerqueue              *workerqueue.WorkerQueue
 	recorder                 record.EventRecorder
 	syncPodPortsToGameServer func(*agonesv1.GameServer, *corev1.Pod) error
+	clock                    clock.Clock
+
+	externalIPMissingMu    sync.Mutex
+	externalIPMissingSince map[string]externalIPMissing
+}
+
+type externalIPMissing struct {
+	podUID   types.UID
+	nodeName string
+	since    time.Time
 }
 
 // NewMigrationController returns a MigrationController
@@ -80,6 +101,8 @@ func NewMigrationController(health healthcheck.Handler,
 		nodeLister:               kubeInformerFactory.Core().V1().Nodes().Lister(),
 		nodeSynced:               kubeInformerFactory.Core().V1().Nodes().Informer().HasSynced,
 		syncPodPortsToGameServer: syncPodPortsToGameServer,
+		clock:                    clock.RealClock{},
+		externalIPMissingSince:   map[string]externalIPMissing{},
 	}
 
 	mc.baseLogger = runtime.NewLoggerWithType(mc)
@@ -93,19 +116,47 @@ func NewMigrationController(health healthcheck.Handler,
 
 	_, _ = podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			pod := obj.(*corev1.Pod)
-			if _, _, ok, err := mc.isMigratingGameServerPod(pod); err != nil || ok {
-				mc.workerqueue.Enqueue(pod)
-			}
+			mc.handlePod(obj.(*corev1.Pod))
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			pod := newObj.(*corev1.Pod)
-			if _, _, ok, err := mc.isMigratingGameServerPod(pod); err != nil || ok {
-				mc.workerqueue.Enqueue(pod)
+			mc.handlePod(newObj.(*corev1.Pod))
+		},
+		DeleteFunc: func(obj interface{}) {
+			if key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj); err == nil {
+				mc.clearExternalIPMissing(key)
 			}
 		},
 	})
+	_, _ = kubeInformerFactory.Core().V1().Nodes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(_, newObj interface{}) {
+			mc.handleNode(newObj.(*corev1.Node))
+		},
+	})
 	return mc
+}
+
+// handleNode forgets when the ExternalIP went missing for Pods on the Node once it is back, since a
+// restore that ends between Pod resyncs would otherwise carry the old start time into the next outage.
+func (mc *MigrationController) handleNode(node *corev1.Node) {
+	if !hasValidExternalIP(node) {
+		return
+	}
+	mc.externalIPMissingMu.Lock()
+	for key, m := range mc.externalIPMissingSince {
+		if m.nodeName == node.ObjectMeta.Name {
+			delete(mc.externalIPMissingSince, key)
+		}
+	}
+	mc.externalIPMissingMu.Unlock()
+}
+
+func (mc *MigrationController) handlePod(pod *corev1.Pod) {
+	_, _, ok, err := mc.isMigratingGameServerPod(pod)
+	if err != nil || ok {
+		mc.workerqueue.Enqueue(pod)
+		return
+	}
+	mc.clearExternalIPMissing(pod.ObjectMeta.Namespace + "/" + pod.ObjectMeta.Name)
 }
 
 // Run processes the rate limited queue.
@@ -173,7 +224,10 @@ func (mc *MigrationController) isMigratingGameServerPod(pod *k8sv1.Pod) (*agones
 
 	// if the nodes match, and the default GameServer Address matches one of the node addresses - escape, since
 	// migration isn't happening.
-	if pod.Spec.NodeName == gs.Status.NodeName && mc.anyAddressMatch(node, gs) {
+	// A replacement GameServer cannot take over a running session, so Allocated GameServers that were
+	// given an internal address while the Node had no external address are left alone.
+	if pod.Spec.NodeName == gs.Status.NodeName && mc.anyAddressMatch(node, gs) &&
+		(gs.Status.State == agonesv1.GameServerStateAllocated || !isExternalAddressRestored(node, gs)) {
 		return nil, nil, false, nil
 	}
 
@@ -195,6 +249,7 @@ func (mc *MigrationController) syncGameServer(ctx context.Context, key string) e
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			mc.loggerForGameServerKey(key).Debug("Pod is no longer available for syncing")
+			mc.clearExternalIPMissing(key)
 			return nil
 		}
 		return errors.Wrapf(err, "error retrieving Pod %s from namespace %s", name, namespace)
@@ -202,21 +257,41 @@ func (mc *MigrationController) syncGameServer(ctx context.Context, key string) e
 
 	gs, node, ok, err := mc.isMigratingGameServerPod(pod)
 	// if there is an error, retry, but if not migrating then escape and continue on with your life doing other things.
-	if err != nil || !ok {
+	if err != nil {
 		return err
 	}
+	if !ok {
+		mc.clearExternalIPMissing(key)
+		return nil
+	}
+
+	if wait := mc.externalIPMissingWait(key, pod, gs, node); wait > 0 {
+		mc.loggerForGameServer(gs).WithField("node", node.ObjectMeta.Name).WithField("retryAfter", wait).
+			Warn("Node ExternalIP is missing, deferring migration check")
+		mc.workerqueue.EnqueueAfter(pod, wait)
+		return nil
+	}
+
+	restored := pod.Spec.NodeName == gs.Status.NodeName && isExternalAddressRestored(node, gs) && mc.anyAddressMatch(node, gs)
 
 	// If the GameServer has yet to become ready, we will reapply the Address and Port
 	// otherwise, we move it to Unhealthy so that a new GameServer will be recreated.
 	gsCopy := gs.DeepCopy()
 	var eventMsg string
-	if gsCopy.IsBeforeReady() {
+	switch {
+	case gsCopy.IsBeforeReady():
 		gsCopy, err = applyGameServerAddressAndPort(gsCopy, node, pod, mc.syncPodPortsToGameServer)
 		if err != nil {
 			return err
 		}
 		eventMsg = "Address updated due to Node migration"
-	} else {
+		if restored {
+			eventMsg = "Address updated due to Node external address restored"
+		}
+	case restored:
+		gsCopy.Status.State = agonesv1.GameServerStateUnhealthy
+		eventMsg = "Node external address restored after GameServer got an internal address"
+	default:
 		gsCopy.Status.State = agonesv1.GameServerStateUnhealthy
 		eventMsg = "Node migration occurred"
 	}
@@ -224,6 +299,7 @@ func (mc *MigrationController) syncGameServer(ctx context.Context, key string) e
 	if gs, err = mc.gameServerGetter.GameServers(gsCopy.ObjectMeta.Namespace).Update(ctx, gsCopy, metav1.UpdateOptions{}); err != nil {
 		return err
 	}
+	mc.clearExternalIPMissing(key)
 
 	mc.loggerForGameServer(gs).Debug("GameServer migration occurred")
 	mc.recorder.Event(gs, corev1.EventTypeWarning, string(gsCopy.Status.State), eventMsg)
@@ -245,4 +321,82 @@ func (mc *MigrationController) anyAddressMatch(node *k8sv1.Node, gs *agonesv1.Ga
 		WithField("node.Status.Addresses", strings.Join(nodeAddresses, ",")).
 		Warn("GameServer/Node address mismatch")
 	return false
+}
+
+// externalIPMissingWait returns how long to wait before treating the GameServer as migrated,
+// when it is on the same Node and was given that Node's ExternalIP, but the Node has no ExternalIP now.
+func (mc *MigrationController) externalIPMissingWait(key string, pod *corev1.Pod, gs *agonesv1.GameServer, node *corev1.Node) time.Duration {
+	if pod.Spec.NodeName != gs.Status.NodeName || hasValidExternalIP(node) {
+		return 0
+	}
+	if addressType(gs.Status.Addresses, gs.Status.Address) != corev1.NodeExternalIP {
+		return 0
+	}
+
+	now := mc.clock.Now()
+	mc.externalIPMissingMu.Lock()
+	m, ok := mc.externalIPMissingSince[key]
+	if !ok || m.podUID != pod.ObjectMeta.UID {
+		m = externalIPMissing{podUID: pod.ObjectMeta.UID, nodeName: pod.Spec.NodeName, since: now}
+		mc.externalIPMissingSince[key] = m
+	}
+	mc.externalIPMissingMu.Unlock()
+
+	return m.since.Add(externalIPMissingGracePeriod).Sub(now)
+}
+
+func (mc *MigrationController) clearExternalIPMissing(key string) {
+	mc.externalIPMissingMu.Lock()
+	delete(mc.externalIPMissingSince, key)
+	mc.externalIPMissingMu.Unlock()
+}
+
+// isExternalAddressRestored reports whether the GameServer was given an internal address while its
+// Node had no external address, and address() would now pick an external one. Comparing with
+// address() keeps a replacement GameServer from being classified the same way again.
+func isExternalAddressRestored(node *corev1.Node, gs *agonesv1.GameServer) bool {
+	switch addressType(gs.Status.Addresses, gs.Status.Address) {
+	case corev1.NodeInternalIP, corev1.NodeInternalDNS:
+	default:
+		return false
+	}
+	addr, _, err := address(node)
+	if err != nil {
+		return false
+	}
+	switch addressType(node.Status.Addresses, addr) {
+	case corev1.NodeExternalDNS, corev1.NodeExternalIP:
+		return true
+	}
+	return false
+}
+
+// addressType returns the type address() would have picked addr as, following its precedence and
+// IP validity rules, or "" if no such entry exists.
+func addressType(addresses []corev1.NodeAddress, addr string) corev1.NodeAddressType {
+	for _, t := range []corev1.NodeAddressType{corev1.NodeExternalDNS, corev1.NodeExternalIP, corev1.NodeInternalDNS, corev1.NodeInternalIP} {
+		for _, a := range addresses {
+			if a.Type == t && a.Address == addr && isUsableAddress(a) {
+				return t
+			}
+		}
+	}
+	return ""
+}
+
+func hasValidExternalIP(node *corev1.Node) bool {
+	for _, a := range node.Status.Addresses {
+		if a.Type == corev1.NodeExternalIP && isUsableAddress(a) {
+			return true
+		}
+	}
+	return false
+}
+
+func isUsableAddress(a corev1.NodeAddress) bool {
+	switch a.Type {
+	case corev1.NodeExternalIP, corev1.NodeInternalIP:
+		return net.ParseIP(a.Address) != nil
+	}
+	return true
 }
