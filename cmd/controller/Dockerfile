@@ -17,15 +17,20 @@ FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
 WORKDIR /src
 COPY . .
 
+RUN bash build/extract-licenses.sh && bash build/build-required-src-dist.sh
+
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -mod=vendor -trimpath -ldflags "-s -w -X agones.dev/agones/pkg.Version=$VERSION" -o /controller ./cmd/controller
+ARG GO_BUILD_TAGS=none
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -mod=vendor -trimpath -tags "$GO_BUILD_TAGS" -ldflags "-s -w -X agones.dev/agones/pkg.Version=$VERSION" -o /controller ./cmd/controller
 
 FROM gcr.io/distroless/static-debian13:nonroot
 
 WORKDIR /
 COPY --from=builder /controller /controller
+COPY --from=builder /tmp/LICENSES .
+COPY --from=builder /tmp/dependencies-src.tgz .
 
 USER nonroot:nonroot
 ENTRYPOINT ["/controller"]

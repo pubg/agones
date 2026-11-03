@@ -30,6 +30,10 @@ bin
 # Allow upgrade test directory
 !/test/upgrade
 
+# Allow scripts the source-building Dockerfiles run for LICENSES and dependencies-src.tgz
+!/build/extract-licenses.sh
+!/build/build-required-src-dist.sh
+
 # Created by .ignore support plugin (hsz.mobi)
 ### Go template
 # Binaries for programs and plugins
