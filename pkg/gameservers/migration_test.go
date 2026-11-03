@@ -16,6 +16,7 @@ package gameservers
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -26,8 +27,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
@@ -283,6 +286,78 @@ func TestMigrationControllerSyncGameServer(t *testing.T) {
 				gs.Status.Addresses = internalAddresses
 				gs.Status.State = agonesv1.GameServerStateAllocated
 				node.Status.Addresses = externalAddresses
+				return gs, pod, node
+			},
+			expected: expected{
+				updated:     false,
+				updateTests: func(_ *testing.T, _ *agonesv1.GameServer) {},
+				postTests: func(t *testing.T, m agtesting.Mocks) {
+					agtesting.AssertNoEvent(t, m.FakeRecorder.Events)
+				},
+			},
+		},
+		"no change, InternalIP and ExternalIP share a value": {
+			setup: func(gs *agonesv1.GameServer, pod *corev1.Pod, node *corev1.Node) (*agonesv1.GameServer, *corev1.Pod, *corev1.Node) {
+				sameValue := []corev1.NodeAddress{{Address: ipFixture, Type: corev1.NodeInternalIP}, {Address: ipFixture, Type: corev1.NodeExternalIP}}
+				gs.Status.NodeName = nodeFixtureName
+				gs.Status.Address = ipFixture
+				gs.Status.Addresses = sameValue
+				gs.Status.State = agonesv1.GameServerStateReady
+				node.Status.Addresses = sameValue
+				return gs, pod, node
+			},
+			expected: expected{
+				updated:     false,
+				updateTests: func(_ *testing.T, _ *agonesv1.GameServer) {},
+				postTests: func(t *testing.T, m agtesting.Mocks) {
+					agtesting.AssertNoEvent(t, m.FakeRecorder.Events)
+				},
+			},
+		},
+		"external address restored before ready, Hostname shares the InternalDNS value": {
+			setup: func(gs *agonesv1.GameServer, pod *corev1.Pod, node *corev1.Node) (*agonesv1.GameServer, *corev1.Pod, *corev1.Node) {
+				internalDNS := "node.internal"
+				gs.Status.NodeName = nodeFixtureName
+				gs.Status.Address = internalDNS
+				gs.Status.Addresses = []corev1.NodeAddress{{Address: internalDNS, Type: corev1.NodeHostName}, {Address: internalDNS, Type: corev1.NodeInternalDNS}}
+				gs.Status.State = agonesv1.GameServerStateScheduled
+				node.Status.Addresses = []corev1.NodeAddress{{Address: internalDNS, Type: corev1.NodeHostName}, {Address: internalDNS, Type: corev1.NodeInternalDNS}, {Address: ipFixture, Type: corev1.NodeExternalIP}}
+				return gs, pod, node
+			},
+			expected: expected{
+				updated: true,
+				updateTests: func(t *testing.T, gs *agonesv1.GameServer) {
+					assert.Equal(t, ipFixture, gs.Status.Address)
+				},
+				postTests: func(t *testing.T, m agtesting.Mocks) {
+					agtesting.AssertEventContains(t, m.FakeRecorder.Events, "Warning Scheduled Address updated due to Node external address restored")
+				},
+			},
+		},
+		"invalid ExternalIP counts as missing, deferred": {
+			setup: func(gs *agonesv1.GameServer, pod *corev1.Pod, node *corev1.Node) (*agonesv1.GameServer, *corev1.Pod, *corev1.Node) {
+				gs.Status.NodeName = nodeFixtureName
+				gs.Status.Address = ipFixture
+				gs.Status.Addresses = externalAddresses
+				gs.Status.State = agonesv1.GameServerStateAllocated
+				node.Status.Addresses = append(externalIPMissingAddresses, corev1.NodeAddress{Address: "", Type: corev1.NodeExternalIP})
+				return gs, pod, node
+			},
+			expected: expected{
+				updated:     false,
+				updateTests: func(_ *testing.T, _ *agonesv1.GameServer) {},
+				postTests: func(t *testing.T, m agtesting.Mocks) {
+					agtesting.AssertNoEvent(t, m.FakeRecorder.Events)
+				},
+			},
+		},
+		"no change, invalid ExternalIP does not count as restored": {
+			setup: func(gs *agonesv1.GameServer, pod *corev1.Pod, node *corev1.Node) (*agonesv1.GameServer, *corev1.Pod, *corev1.Node) {
+				gs.Status.NodeName = nodeFixtureName
+				gs.Status.Address = internalIPFixture
+				gs.Status.Addresses = internalAddresses
+				gs.Status.State = agonesv1.GameServerStateReady
+				node.Status.Addresses = append(internalAddresses, corev1.NodeAddress{Address: "not-an-ip", Type: corev1.NodeExternalIP})
 				return gs, pod, node
 			},
 			expected: expected{
@@ -602,7 +677,9 @@ func TestMigrationControllerExternalIPMissingGracePeriod(t *testing.T) {
 		pod         *corev1.Pod
 		node        *corev1.Node
 		nodeIndexer cache.Indexer
+		podIndexer  cache.Indexer
 		updated     *bool
+		failUpdate  *bool
 		ctx         context.Context
 	}
 
@@ -637,7 +714,11 @@ func TestMigrationControllerExternalIPMissingGracePeriod(t *testing.T) {
 			return true, &corev1.PodList{Items: []corev1.Pod{*pod}}, nil
 		})
 		updated := false
+		failUpdate := false
 		m.AgonesClient.AddReactor("update", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if failUpdate {
+				return true, nil, k8serrors.NewConflict(agonesv1.Resource("gameservers"), "test", errors.New("conflict"))
+			}
 			updated = true
 			gs := action.(k8stesting.UpdateAction).GetObject().(*agonesv1.GameServer)
 			assert.Equal(t, agonesv1.GameServerStateUnhealthy, gs.Status.State)
@@ -646,8 +727,9 @@ func TestMigrationControllerExternalIPMissingGracePeriod(t *testing.T) {
 
 		ctx, cancel := agtesting.StartInformers(m, c.nodeSynced, c.gameServerSynced, c.podSynced)
 		t.Cleanup(cancel)
-		return fixture{c: c, clock: fc, pod: pod, node: node, updated: &updated, ctx: ctx,
-			nodeIndexer: m.KubeInformerFactory.Core().V1().Nodes().Informer().GetIndexer()}
+		return fixture{c: c, clock: fc, pod: pod, node: node, updated: &updated, failUpdate: &failUpdate, ctx: ctx,
+			nodeIndexer: m.KubeInformerFactory.Core().V1().Nodes().Informer().GetIndexer(),
+			podIndexer:  m.KubeInformerFactory.Core().V1().Pods().Informer().GetIndexer()}
 	}
 
 	setNodeAddresses := func(t *testing.T, f fixture, addresses []corev1.NodeAddress) {
@@ -686,6 +768,61 @@ func TestMigrationControllerExternalIPMissingGracePeriod(t *testing.T) {
 		require.NoError(t, f.c.syncGameServer(f.ctx, "default/test"))
 		assert.False(t, *f.updated)
 		assert.Contains(t, f.c.externalIPMissingSince, "default/test")
+	})
+
+	t.Run("Node update with the ExternalIP back resets the grace period", func(t *testing.T) {
+		f := setup(t)
+
+		require.NoError(t, f.c.syncGameServer(f.ctx, "default/test"))
+		assert.Contains(t, f.c.externalIPMissingSince, "default/test")
+
+		missing := f.node.DeepCopy()
+		f.c.handleNode(missing)
+		assert.Contains(t, f.c.externalIPMissingSince, "default/test")
+
+		restored := f.node.DeepCopy()
+		restored.Status.Addresses = externalAddresses
+		f.c.handleNode(restored)
+		assert.Empty(t, f.c.externalIPMissingSince)
+	})
+
+	t.Run("failed update keeps the grace period start", func(t *testing.T) {
+		f := setup(t)
+
+		require.NoError(t, f.c.syncGameServer(f.ctx, "default/test"))
+		f.clock.Step(externalIPMissingGracePeriod)
+
+		*f.failUpdate = true
+		require.Error(t, f.c.syncGameServer(f.ctx, "default/test"))
+		assert.Contains(t, f.c.externalIPMissingSince, "default/test")
+
+		*f.failUpdate = false
+		require.NoError(t, f.c.syncGameServer(f.ctx, "default/test"))
+		assert.True(t, *f.updated)
+		assert.Empty(t, f.c.externalIPMissingSince)
+	})
+
+	t.Run("replacement Pod gets its own grace period", func(t *testing.T) {
+		f := setup(t)
+
+		require.NoError(t, f.c.syncGameServer(f.ctx, "default/test"))
+		f.clock.Step(externalIPMissingGracePeriod)
+
+		replacement := f.pod.DeepCopy()
+		replacement.ObjectMeta.UID = "replacement"
+		require.NoError(t, f.podIndexer.Update(replacement))
+		require.NoError(t, f.c.syncGameServer(f.ctx, "default/test"))
+		assert.False(t, *f.updated)
+		assert.Equal(t, types.UID("replacement"), f.c.externalIPMissingSince["default/test"].podUID)
+	})
+
+	t.Run("missing Pod clears the record", func(t *testing.T) {
+		f := setup(t)
+
+		require.NoError(t, f.c.syncGameServer(f.ctx, "default/test"))
+		require.NoError(t, f.podIndexer.Delete(f.pod))
+		require.NoError(t, f.c.syncGameServer(f.ctx, "default/test"))
+		assert.Empty(t, f.c.externalIPMissingSince)
 	})
 }
 
