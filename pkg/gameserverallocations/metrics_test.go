@@ -36,6 +36,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opencensus.io/stats/view"
+	"go.opencensus.io/tag"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -181,6 +182,72 @@ func metricDistributions(t *testing.T, viewName string) map[string]*view.Distrib
 		values[group] = row.Data.(*view.DistributionData)
 	}
 	return values
+}
+
+func TestAllocationLatencySeparatesSameFleetNameByNamespace(t *testing.T) {
+	resetMetrics()
+	gsl := mockGameServerLister{
+		gameServerNamespaceLister: mockGameServerNamespaceLister{
+			gameServer: &agonesv1.GameServer{ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{agonesv1.FleetNameLabel: "shared-fleet"},
+			}},
+		},
+	}
+	allocate := func(namespace string) {
+		ctx, err := tag.New(context.Background(), latencyTags...)
+		require.NoError(t, err)
+		recorder := metrics{ctx: ctx, gameServerLister: &gsl, logger: runtime.NewLoggerWithSource("metrics_test"), start: time.Now()}
+		gsa := &allocationv1.GameServerAllocation{ObjectMeta: metav1.ObjectMeta{Namespace: namespace}}
+		recorder.setRequest(gsa)
+		recorder.setResponse(&allocationv1.GameServerAllocation{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace},
+			Status: allocationv1.GameServerAllocationStatus{
+				State:          allocationv1.GameServerAllocationAllocated,
+				GameServerName: "gameServerName",
+				Source:         localAllocationSource,
+			},
+		})
+		recorder.record()
+	}
+
+	allocate("game-a")
+	allocate("game-b")
+	allocate("game-b")
+
+	rows, err := view.RetrieveData("gameserver_allocations_duration_seconds")
+	require.NoError(t, err)
+	counts := map[string]int64{}
+	for _, row := range rows {
+		tags := map[string]string{}
+		for _, metricTag := range row.Tags {
+			tags[metricTag.Key.Name()] = metricTag.Value
+		}
+		assert.Equal(t, "shared-fleet", tags[keyFleetName.Name()])
+		assert.Equal(t, string(allocationv1.GameServerAllocationAllocated), tags[keyStatus.Name()])
+		counts[tags[keyNamespace.Name()]] += row.Data.(*view.DistributionData).Count
+	}
+	assert.Equal(t, map[string]int64{"game-a": 1, "game-b": 2}, counts)
+}
+
+func TestAllocationLatencyDefaultsNamespaceTag(t *testing.T) {
+	resetMetrics()
+	ctx, err := tag.New(context.Background(), latencyTags...)
+	require.NoError(t, err)
+	recorder := metrics{ctx: ctx, logger: runtime.NewLoggerWithSource("metrics_test"), start: time.Now()}
+
+	recorder.setRequest(&allocationv1.GameServerAllocation{})
+	recorder.record()
+
+	rows, err := view.RetrieveData("gameserver_allocations_duration_seconds")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	namespace := ""
+	for _, metricTag := range rows[0].Tags {
+		if metricTag.Key == keyNamespace {
+			namespace = metricTag.Value
+		}
+	}
+	assert.Equal(t, "none", namespace)
 }
 
 func TestSetResponse(t *testing.T) {

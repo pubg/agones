@@ -55,7 +55,7 @@ var (
 			Measure:     gameServerAllocationsLatency,
 			Description: "The distribution of gameserver allocation requests latencies.",
 			Aggregation: view.Distribution(0, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2, 3),
-			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy},
+			TagKeys:     []tag.Key{keyFleetName, keyClusterName, keyMultiCluster, keyStatus, keySchedulingStrategy, keyNamespace},
 		},
 		{
 			Name:        "gameserver_allocations_retry_total",
@@ -111,6 +111,7 @@ var latencyTags = []tag.Mutator{
 	tag.Insert(keySchedulingStrategy, "none"),
 	tag.Insert(keyFleetName, "none"),
 	tag.Insert(keyStatus, "none"),
+	tag.Insert(keyNamespace, "none"),
 }
 
 type metrics struct {
@@ -147,6 +148,11 @@ func (r *metrics) setRequest(in *allocationv1.GameServerAllocation) {
 	}
 
 	tags = append(tags, tag.Update(keyMultiCluster, strconv.FormatBool(in.Spec.MultiClusterSetting.Enabled)))
+	// fleet_name is only unique within a namespace, so tag the request namespace to keep
+	// same-named Fleets in different namespaces distinguishable.
+	if in.Namespace != "" {
+		tags = append(tags, tag.Update(keyNamespace, in.Namespace))
+	}
 	r.mutate(tags...)
 }
 
